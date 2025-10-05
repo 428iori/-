@@ -1,19 +1,26 @@
 # -*- coding: utf-8 -*-
 """
-実運用版 AI株式シミュレーター（当日収益表示 + Discord通知）
+実運用版 AI株式シミュレーター（LightGBMウォークフォワード + Discord通知 + 本日収益表示）
+自動実行用：GitHub Actionsなどで定期実行可能
 """
 
-import os, datetime, pytz, requests, traceback
+import os
+import datetime
+import pytz
+import requests
+import traceback
 import pandas as pd
 import numpy as np
 import yfinance as yf
 import lightgbm as lgb
 from sklearn.metrics import roc_auc_score
 
-# ===== 設定 =====
+# ======================================
+# 設定
+# ======================================
 CFG = {
     "TIMEZONE": "Asia/Tokyo",
-    "START_CAPITAL": 1_000_000,
+    "START_CAPITAL": 1_000_000,  # 初期資金
     "PROB_TH": 0.58,
     "TOP_K": 5,
     "TRAIN_MONTHS": 6,
@@ -22,8 +29,11 @@ CFG = {
     "END": None,
 }
 
-# ===== Discord通知関数 =====
+# ======================================
+# Discord 通知関数
+# ======================================
 def notify_discord(msg: str):
+    """Discordにメッセージを送信"""
     url = os.environ.get("DISCORD_WEBHOOK_URL")
     if not url:
         print("⚠️ Webhook未設定")
@@ -36,7 +46,9 @@ def notify_discord(msg: str):
     except Exception as e:
         print(f"❌ Discord通知失敗: {e}")
 
-# ===== RSIなど特徴量 =====
+# ======================================
+# RSIなどの特徴量生成
+# ======================================
 def rsi(series, n=14):
     diff = series.diff()
     up = diff.clip(lower=0)
@@ -55,42 +67,71 @@ def make_features(df):
     df["sma10"] = c.rolling(10).mean()
     df["sma30"] = c.rolling(30).mean()
     df["ma_gap"] = (c - df["sma30"]) / (df["sma30"] + 1e-12)
-    df = df.dropna()
-    return df
+    return df.dropna()
 
-# ===== データ取得 =====
+# ======================================
+# データ取得
+# ======================================
 def load_data():
+    """主要銘柄をyfinanceから取得"""
     tickers = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META"]
-    data = yf.download(tickers, start=CFG["START"], end=CFG["END"], group_by="ticker", threads=True)
+    print(f"📈 データ取得中: {tickers}")
+    data = yf.download(tickers, start=CFG["START"], end=CFG["END"], group_by="ticker", threads=True, progress=False)
     out = []
     for t in tickers:
-        df = data[t].reset_index().dropna()
-        df["Ticker"] = t
-        df = make_features(df)
-        out.append(df)
+        try:
+            df = data[t].reset_index().dropna()
+            df["Ticker"] = t
+            df = make_features(df)
+            out.append(df)
+        except Exception as e:
+            print(f"⚠️ {t}取得失敗: {e}")
+            continue
     return pd.concat(out)
 
-# ===== ラベル生成 =====
+# ======================================
+# ラベル生成（翌日上昇 or 下落）
+# ======================================
 def add_labels(df):
     df["ret_next1"] = df.groupby("Ticker")["Close"].shift(-1) / df["Close"] - 1
     df["label"] = (df["ret_next1"] > 0.002).astype(int)
     return df.dropna()
 
-# ===== 学習 & テスト =====
+# ======================================
+# 学習 LightGBM
+# ======================================
 def train_lgb(train_df):
     feats = ["ret1","ret5","rsi","volatility","ma_gap"]
     X = train_df[feats]; y = train_df["label"]
-    params = {"objective":"binary","learning_rate":0.03,"num_leaves":15,"n_estimators":100,"verbosity":-1}
-    return lgb.train(params, lgb.Dataset(X, label=y))
+    params = {
+        "objective": "binary",
+        "learning_rate": 0.03,
+        "num_leaves": 15,
+        "n_estimators": 100,
+        "verbosity": -1,
+        "metric": "auc"
+    }
+    print("🎯 LightGBM 学習開始...")
+    model = lgb.train(params, lgb.Dataset(X, label=y))
+    print("✅ LightGBM 学習完了")
+    return model
 
+# ======================================
+# バックテスト（簡易）
+# ======================================
 def backtest(df, model):
     feats = ["ret1","ret5","rsi","volatility","ma_gap"]
+    df = df.copy()
     df["prob"] = model.predict(df[feats])
-    top = df.groupby("Date").apply(lambda g: g.nlargest(CFG["TOP_K"], "prob"))
+    # 各日ごとに確率上位を選択
+    top = df.groupby("Date", group_keys=False).apply(lambda g: g.nlargest(CFG["TOP_K"], "prob"))
     mean_ret = top["ret_next1"].mean()
+    print(f"📊 平均日次リターン: {mean_ret*100:.3f}%")
     return mean_ret
 
-# ===== メイン =====
+# ======================================
+# メイン
+# ======================================
 def main():
     tz = pytz.timezone(CFG["TIMEZONE"])
     now = datetime.datetime.now(tz)
@@ -99,22 +140,28 @@ def main():
     try:
         df = load_data()
         df = add_labels(df)
-        split = int(len(df)*0.8)
+
+        # データ分割（80%学習, 20%テスト）
+        split = int(len(df) * 0.8)
         tr, te = df.iloc[:split], df.iloc[split:]
+
+        # モデル訓練
         model = train_lgb(tr)
-        mean_ret = backtest(te, model)
+
+        # バックテスト（平均日次リターン）
+        today_return = backtest(te, model)
 
         # === 収益計算 ===
-        today_return = mean_ret
         capital = CFG["START_CAPITAL"] * (1 + today_return)
         profit = capital - CFG["START_CAPITAL"]
 
         msg = (
             f"✅ 実行完了\n"
             f"平均日次リターン: {today_return*100:+.2f}%\n"
-            f"本日の収益: {profit:+.0f}円\n"
+            f"本日の収益: {profit:+,.0f}円\n"
             f"累計資産: {capital:,.0f}円"
         )
+
         print(msg)
         notify_discord(msg)
 
@@ -123,8 +170,12 @@ def main():
         notify_discord(f"❌ 実行中エラー\n{e}\n```\n{err}\n```")
         raise
 
+# ======================================
+# 実行
+# ======================================
 if __name__ == "__main__":
     main()
+
 
 
 
@@ -484,6 +535,7 @@ def run_production_day():
 # ====== RUN ======
 res = run_production_day()
 res
+
 
 
 
