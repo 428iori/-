@@ -1,26 +1,30 @@
 # -*- coding: utf-8 -*-
 """
-Production Runner: AI株式シミュレーター（LightGBM + Walk-Forward）
-- 未来リーク完全遮断（学習は直近Nヶ月のみ）
-- 毎朝：最新データ取得 → 再学習 → 翌営業日の発注リスト作成
-- 予測確率のソフトマックス配分（温度T）＋ しきい値で参戦/休むを自動判断
-- セクター偏り制御（任意）・ポジション上限・想定スリッページ・手数料
-- Discord通知（Webhook）・成果物保存（CSV/PNG/JSON）
+実運用版 AI株式シミュレーター起動スクリプト
 """
 
-# ====== INSTALL ======
-!pip -q install yfinance lightgbm pandas numpy matplotlib scikit-learn requests pytz
-
-# ====== IMPORTS ======
-import os, json, time, math, warnings, datetime
-import numpy as np
-import pandas as pd
 import yfinance as yf
 import lightgbm as lgb
+import pandas as pd
+import numpy as np
 import requests
-import matplotlib.pyplot as plt
-from pytz import timezone
-warnings.filterwarnings("ignore")
+import datetime
+import pytz
+import os
+
+# Discord通知関数
+def notify_discord(msg: str):
+    url = os.environ.get("DISCORD_WEBHOOK_URL")
+    if not url:
+        print("⚠️ Discord Webhook URLが設定されていません。")
+        return
+    payload = {"content": msg}
+    try:
+        r = requests.post(url, json=payload)
+        r.raise_for_status()
+        print("✅ Discord通知送信完了")
+    except Exception as e:
+        print(f"❌ Discord通知失敗: {e}")
 
 # ====== CONFIG ======
 CFG = {
@@ -376,3 +380,4 @@ def run_production_day():
 # ====== RUN ======
 res = run_production_day()
 res
+
