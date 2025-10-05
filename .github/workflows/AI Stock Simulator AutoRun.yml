@@ -1,26 +1,31 @@
-name: Daily AI Simulator Run
+name: Run AI Stock Simulator
 
 on:
   schedule:
-    - cron: "0 0 * * *"   # 日本時間9時に自動実行
+    # 平日 朝6:00（日本時間）＝ UTC 21:00 前日
+    - cron: '0 21 * * 1-5'
   workflow_dispatch:
 
 jobs:
-  run:
+  run-simulator:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
       - name: Install dependencies
         run: |
-          pip install -r requirements.txt
+          python -m pip install --upgrade pip
+          pip install -q yfinance lightgbm scikit-learn pandas numpy matplotlib requests
 
-      - name: Run AI Simulator
+      - name: Run production simulation
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: |
           python run_production_day.py
-
