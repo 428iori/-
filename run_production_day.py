@@ -9,40 +9,20 @@ import pandas as pd
 import numpy as np
 import requests
 import datetime
-from datetime import timezone, timedelta
+from datetime import timedelta
 import pytz
-import os
 
-# ===== 設定 =====
-CFG = {
-    "TIMEZONE": "Asia/Tokyo",
-    "START_CAPITAL": 1_000_000,
-}
+CFG = {"TIMEZONE": "Asia/Tokyo"}
 
-# Discord通知関数
-def notify_discord(msg: str):
-    url = os.environ.get("DISCORD_WEBHOOK_URL")
-    if not url:
-        print("⚠️ Discord Webhook URLが設定されていません。")
-        return
-    payload = {"content": msg}
-    try:
-        r = requests.post(url, json=payload)
-        r.raise_for_status()
-        print("✅ Discord通知送信完了")
-    except Exception as e:
-        print(f"❌ Discord通知失敗: {e}")
-
-# ===== メイン処理 =====
 def main():
-    tz = pytz.timezone(CFG["TIMEZONE"])
-    now = datetime.datetime.now(tz)
+    TZ = pytz.timezone(CFG["TIMEZONE"])
+    now = datetime.datetime.now(TZ)
     msg = f"🚀 実運用AIシミュレーターを起動しました。\n時刻: {now.strftime('%Y-%m-%d %H:%M:%S')}"
     print(msg)
-    notify_discord(msg)
 
 if __name__ == "__main__":
     main()
+
 
 
 # ====== CONFIG ======
@@ -399,5 +379,6 @@ def run_production_day():
 # ====== RUN ======
 res = run_production_day()
 res
+
 
 
