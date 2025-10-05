@@ -8,7 +8,6 @@ import lightgbm as lgb
 import pandas as pd
 import numpy as np
 import requests
-import datetime
 import pytz
 import os
 
@@ -34,7 +33,6 @@ def notify_discord(msg: str):
 
 # ===== メイン処理 =====
 def main():
-    tz = pytz.timezone(CFG["TIMEZONE"])
     now = datetime.datetime.now(tz)
     msg = f"🚀 実運用AIシミュレーターを起動しました。\n時刻: {now.strftime('%Y-%m-%d %H:%M:%S')}"
     print(msg)
@@ -399,6 +397,7 @@ def run_production_day():
 # ====== RUN ======
 res = run_production_day()
 res
+
 
 
 
