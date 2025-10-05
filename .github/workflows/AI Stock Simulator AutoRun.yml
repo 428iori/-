@@ -1,26 +1,26 @@
-name: AI Stock Simulator AutoRun
+name: Daily AI Simulator Run
 
 on:
   schedule:
-    - cron: "0 0 * * *"  # 毎日 UTC 0時（日本時間 9:00）に実行
-  workflow_dispatch:      # 手動実行も可能
+    - cron: "0 0 * * *"   # 日本時間9時に自動実行
+  workflow_dispatch:
 
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v3
-
-      - name: Setup Python
-        uses: actions/setup-python@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          pip install -r requirements.txt
 
-      - name: Run trading simulator
+      - name: Run AI Simulator
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        run: python run_production_day.py
+        run: |
+          python run_production_day.py
+
