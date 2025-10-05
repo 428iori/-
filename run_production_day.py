@@ -15,7 +15,6 @@ import pytz
 CFG = {"TIMEZONE": "Asia/Tokyo"}
 
 def main():
-    TZ = pytz.timezone(CFG["TIMEZONE"])
     now = datetime.datetime.now(TZ)
     msg = f"🚀 実運用AIシミュレーターを起動しました。\n時刻: {now.strftime('%Y-%m-%d %H:%M:%S')}"
     print(msg)
@@ -379,6 +378,7 @@ def run_production_day():
 # ====== RUN ======
 res = run_production_day()
 res
+
 
 
 
