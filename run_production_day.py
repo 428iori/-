@@ -133,7 +133,6 @@ def backtest(df, model):
 # メイン
 # ======================================
 def main():
-    tz = pytz.timezone(CFG["TIMEZONE"])
     now = datetime.datetime.now(tz)
     notify_discord(f"🚀 AIシミュレーター自動起動 ({now.strftime('%Y-%m-%d %H:%M:%S')})")
 
@@ -535,6 +534,7 @@ def run_production_day():
 # ====== RUN ======
 res = run_production_day()
 res
+
 
 
 
