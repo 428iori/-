@@ -123,7 +123,6 @@ def backtest(df, model):
     feats = ["ret1","ret5","rsi","volatility","ma_gap"]
     df = df.copy()
     df["prob"] = model.predict(df[feats])
-    # 各日ごとに確率上位を選択
     top = df.groupby("Date", group_keys=False).apply(lambda g: g.nlargest(CFG["TOP_K"], "prob"))
     mean_ret = top["ret_next1"].mean()
     print(f"📊 平均日次リターン: {mean_ret*100:.3f}%")
@@ -133,47 +132,8 @@ def backtest(df, model):
 # メイン
 # ======================================
 def main():
-    now = datetime.datetime.now(tz)
-    notify_discord(f"🚀 AIシミュレーター自動起動 ({now.strftime('%Y-%m-%d %H:%M:%S')})")
+    tz = pytz.ti
 
-    try:
-        df = load_data()
-        df = add_labels(df)
-
-        # データ分割（80%学習, 20%テスト）
-        split = int(len(df) * 0.8)
-        tr, te = df.iloc[:split], df.iloc[split:]
-
-        # モデル訓練
-        model = train_lgb(tr)
-
-        # バックテスト（平均日次リターン）
-        today_return = backtest(te, model)
-
-        # === 収益計算 ===
-        capital = CFG["START_CAPITAL"] * (1 + today_return)
-        profit = capital - CFG["START_CAPITAL"]
-
-        msg = (
-            f"✅ 実行完了\n"
-            f"平均日次リターン: {today_return*100:+.2f}%\n"
-            f"本日の収益: {profit:+,.0f}円\n"
-            f"累計資産: {capital:,.0f}円"
-        )
-
-        print(msg)
-        notify_discord(msg)
-
-    except Exception as e:
-        err = traceback.format_exc()
-        notify_discord(f"❌ 実行中エラー\n{e}\n```\n{err}\n```")
-        raise
-
-# ======================================
-# 実行
-# ======================================
-if __name__ == "__main__":
-    main()
 
 
 
@@ -534,6 +494,7 @@ def run_production_day():
 # ====== RUN ======
 res = run_production_day()
 res
+
 
 
 
