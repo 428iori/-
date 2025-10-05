@@ -1,55 +1,102 @@
 # -*- coding: utf-8 -*-
 """
-実運用版 AI株式シミュレーター（LightGBMウォークフォワード + Discord通知 + 本日収益表示）
-自動実行用：GitHub Actionsなどで定期実行可能
+決定版：AI株式シミュレーター（6m→1m｜Aggressive｜Discord通知付）
+- LightGBM（GPU自動使用）
+- p×μ法（1/3/5日保有を日次最適選択）
+- 確率校正（Isotonic/Platt）
+- 固定分位しきい値（攻め型）
+- 温度ソフトマックス集中配分
+- セクター上限解除
+- Discord通知（前日比・収益額・累計）
 """
 
-import os
-import datetime
-import pytz
-import requests
-import traceback
-import pandas as pd
 import numpy as np
+import pandas as pd
 import yfinance as yf
 import lightgbm as lgb
-from sklearn.metrics import roc_auc_score
+import warnings, os, requests
+from sklearn.isotonic import IsotonicRegression
+from sklearn.linear_model import LogisticRegression
 
-# ======================================
+warnings.filterwarnings("ignore")
+
+# =========================
 # 設定
-# ======================================
-CFG = {
-    "TIMEZONE": "Asia/Tokyo",
-    "START_CAPITAL": 1_000_000,  # 初期資金
-    "PROB_TH": 0.58,
-    "TOP_K": 5,
-    "TRAIN_MONTHS": 6,
-    "TEST_MONTHS": 1,
-    "START": "2015-01-01",
-    "END": None,
-}
+# =========================
+START = "2015-01-01"
+END   = None
+RANDOM_SEED = 42
 
-# ======================================
-# Discord 通知関数
-# ======================================
-def notify_discord(msg: str):
-    """Discordにメッセージを送信"""
-    url = os.environ.get("DISCORD_WEBHOOK_URL")
-    if not url:
-        print("⚠️ Webhook未設定")
-        return
-    payload = {"content": msg}
-    try:
-        r = requests.post(url, json=payload)
-        r.raise_for_status()
-        print("✅ Discord通知送信完了")
-    except Exception as e:
-        print(f"❌ Discord通知失敗: {e}")
+TRAIN_MONTHS = 6
+TEST_MONTHS  = 1
 
-# ======================================
-# RSIなどの特徴量生成
-# ======================================
-def rsi(series, n=14):
+TOP_K = 3
+INIT_CAPITAL = 1_000_000
+PER_POS_FRAC = 0.20
+COMMISSION   = 0.0005
+
+USE_CALIBRATION  = True
+CALIB_METHOD     = "isotonic"   # or "platt"
+
+USE_DYNAMIC_TH   = False
+FIXED_SCORE_QUANTILE = 0.50
+
+SOFTMAX_TEMP     = 0.15
+MIN_WEIGHT_CUT   = 0.00
+
+RET_CLIP_LOW, RET_CLIP_HIGH = -0.08, 0.30
+
+MAX_PER_SECTOR = None
+SKIP_SECTOR_FOR_UNKNOWN = True
+
+# =========================
+# LightGBM パラメータ
+# =========================
+def _lgb_params(device_try_gpu=True):
+    params = {
+        "objective": "binary",
+        "metric": "auc",
+        "boosting_type": "gbdt",
+        "random_state": RANDOM_SEED,
+        "verbosity": -1,
+        "learning_rate": 0.05,
+        "num_leaves": 31,
+        "n_estimators": 400,
+        "max_depth": -1,
+        "feature_fraction": 0.8,
+        "bagging_fraction": 0.8,
+        "bagging_freq": 3,
+        "min_child_samples": 40,
+        "lambda_l2": 5.0,
+    }
+    if device_try_gpu:
+        try:
+            params["device_type"] = "gpu"
+            _ = lgb.train(params, lgb.Dataset(np.zeros((5,3)), label=np.zeros(5)))
+        except Exception:
+            params.pop("device_type", None)
+    return params
+
+# =========================
+# ユニバース（代表100銘柄）※SQ除外（yfinanceのTZエラー回避）
+# =========================
+ALL_TICKERS = [
+    "AAPL","MSFT","GOOGL","AMZN","META","NVDA","TSLA","AMD","NFLX","ADBE",
+    "CRM","INTC","IBM","ORCL","QCOM","AVGO","CSCO","TXN","MU","SHOP",
+    "SNOW","PANW","TEAM","DDOG","PLTR","UBER","ABNB","PYPL","NOW","ZM",
+    "CRWD","MDB","RBLX","NET","ZS","COST","WMT","HD","LOW","TGT",
+    "MCD","SBUX","NKE","KO","PEP","PG","PM","DIS","BKNG","F",
+    "GM","CAT","BA","GE","DE","UPS","FDX","HON","MMM","LMT",
+    "RTX","NOC","GD","XOM","CVX","COP","PSX","MPC","OXY","SLB",
+    "EOG","DVN","APA","FCX","NEM","JPM","BAC","C","MS","GS",
+    "BLK","SCHW","SPGI","ICE","V","MA","AXP","JNJ","PFE","MRK",
+    "BMY","LLY","UNH","CI","HUM","CVS","TMO","DHR","MDT"
+]
+
+# =========================
+# テクニカル指標
+# =========================
+def rsi(series: pd.Series, n=14):
     diff = series.diff()
     up = diff.clip(lower=0)
     dn = -diff.clip(upper=0)
@@ -57,159 +104,6 @@ def rsi(series, n=14):
     ma_dn = dn.ewm(alpha=1/n, adjust=False).mean()
     rs = ma_up / (ma_dn + 1e-12)
     return 100 - (100 / (1 + rs))
-
-def make_features(df):
-    c = df["Close"]
-    df["ret1"] = c.pct_change()
-    df["ret5"] = c.pct_change(5)
-    df["rsi"] = rsi(c)
-    df["volatility"] = c.pct_change().rolling(20).std()
-    df["sma10"] = c.rolling(10).mean()
-    df["sma30"] = c.rolling(30).mean()
-    df["ma_gap"] = (c - df["sma30"]) / (df["sma30"] + 1e-12)
-    return df.dropna()
-
-# ======================================
-# データ取得
-# ======================================
-def load_data():
-    """主要銘柄をyfinanceから取得"""
-    tickers = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META"]
-    print(f"📈 データ取得中: {tickers}")
-    data = yf.download(tickers, start=CFG["START"], end=CFG["END"], group_by="ticker", threads=True, progress=False)
-    out = []
-    for t in tickers:
-        try:
-            df = data[t].reset_index().dropna()
-            df["Ticker"] = t
-            df = make_features(df)
-            out.append(df)
-        except Exception as e:
-            print(f"⚠️ {t}取得失敗: {e}")
-            continue
-    return pd.concat(out)
-
-# ======================================
-# ラベル生成（翌日上昇 or 下落）
-# ======================================
-def add_labels(df):
-    df["ret_next1"] = df.groupby("Ticker")["Close"].shift(-1) / df["Close"] - 1
-    df["label"] = (df["ret_next1"] > 0.002).astype(int)
-    return df.dropna()
-
-# ======================================
-# 学習 LightGBM
-# ======================================
-def train_lgb(train_df):
-    feats = ["ret1","ret5","rsi","volatility","ma_gap"]
-    X = train_df[feats]; y = train_df["label"]
-    params = {
-        "objective": "binary",
-        "learning_rate": 0.03,
-        "num_leaves": 15,
-        "n_estimators": 100,
-        "verbosity": -1,
-        "metric": "auc"
-    }
-    print("🎯 LightGBM 学習開始...")
-    model = lgb.train(params, lgb.Dataset(X, label=y))
-    print("✅ LightGBM 学習完了")
-    return model
-
-# ======================================
-# バックテスト（簡易）
-# ======================================
-def backtest(df, model):
-    feats = ["ret1","ret5","rsi","volatility","ma_gap"]
-    df = df.copy()
-    df["prob"] = model.predict(df[feats])
-    top = df.groupby("Date", group_keys=False).apply(lambda g: g.nlargest(CFG["TOP_K"], "prob"))
-    mean_ret = top["ret_next1"].mean()
-    print(f"📊 平均日次リターン: {mean_ret*100:.3f}%")
-    return mean_ret
-
-# ======================================
-# メイン
-# ======================================
-def main():
-    tz = pytz.ti
-
-
-
-
-
-
-
-# ====== CONFIG ======
-CFG = {
-    # 基本
-    "START": "2015-01-01",
-    "END": None,
-    "TIMEZONE": "Asia/Tokyo",
-    "RANDOM_SEED": 42,
-
-    # 運用パラメータ（発注）
-    "INIT_CAPITAL": 1_000_000,     # 運用資金の基準（配分計算用）
-    "DAILY_CAPITAL": 1_000_000,    # その日の実際の投下資金（変更可）
-    "MAX_GROSS_EXPOSURE": 1.00,    # 合計比率の上限（<=1.0）
-    "COMMISSION": 0.0005,          # 往復手数料の片道分
-    "SLIPPAGE": 0.0005,            # スリッページ（片道）
-    "POSITION_CAP_PCT": 0.35,      # 1銘柄の上限比率（35%）
-
-    # モデル・特徴量
-    "TRAIN_MONTHS": 6,             # 学習窓
-    "HOLD_MODE": "1d",             # 翌日用シグナル想定
-    "LGBM": {"learning_rate":0.03, "num_leaves":31, "n_estimators":200, "max_depth":6},
-
-    # 銘柄選定ロジック
-    "TOP_K": 3,                    # 最大採用銘柄数
-    "PROB_TH": 0.60,               # 参戦しきい値（平均がこれ未満ならノーポジ）
-    "SOFTMAX_TEMP": 0.15,          # 温度パラメータ（小さいほど集中）
-    "MIN_WEIGHT_CUT": 0.00,        # 極小ウェイト切り捨て
-
-    # リスク制御
-    "RET_CLIP_LOW": -0.10,         # 想定下限（ストレステスト/配分計算の参考）
-    "RET_CLIP_HIGH": 0.40,         # 想定上限
-    "MAX_PER_SECTOR": 1,           # 同一セクター最大銘柄数（Noneで無効）
-    "SECTOR_MAP_CSV": None,        # "sectors.csv" を与えると適用（columns: ticker,sector）
-
-    # Discord通知（任意）
-    "DISCORD_WEBHOOK": "DISCORD_WEBHOOK_URL",         # 例: "https://discord.com/api/webhooks/xxxx"
-    
-    # 成果物保存
-    "OUT_DIR": "prod_outputs",     # 生成物フォルダ
-    "SAVE_EQUITY_IMG": True,
-    "SAVE_SIGNALS_CSV": True,
-    "SAVE_ORDERS_CSV": True,
-    "SAVE_SUMMARY_JSON": True,
-}
-
-np.random.seed(CFG["RANDOM_SEED"])
-TZ = timezone(CFG["TIMEZONE"])
-os.makedirs(CFG["OUT_DIR"], exist_ok=True)
-
-# ====== UNIVERSE ======
-ALL_TICKERS = [
-    "AAPL","MSFT","GOOGL","AMZN","META","NVDA","TSLA","AMD","NFLX","ADBE",
-    "CRM","INTC","IBM","ORCL","QCOM","AVGO","CSCO","TXN","MU","SHOP",
-    "SNOW","PANW","TEAM","DDOG","PLTR","UBER","ABNB","PYPL","NOW",
-    "ZM","CRWD","MDB","RBLX","NET","ZS","COST","WMT","HD","LOW",
-    "TGT","MCD","SBUX","NKE","KO","PEP","PG","PM","DIS","BKNG",
-    "F","GM","CAT","BA","GE","DE","UPS","FDX","HON","MMM",
-    "LMT","RTX","NOC","GD","XOM","CVX","COP","PSX","MPC","OXY",
-    "SLB","EOG","DVN","APA","FCX","NEM","JPM","BAC","C","MS",
-    "GS","BLK","SCHW","SPGI","ICE","V","MA","AXP","JNJ","PFE",
-    "MRK","BMY","LLY","UNH","CI","HUM","CVS","TMO","DHR","MDT"
-]
-
-# ====== FEATURES ======
-def rsi(series: pd.Series, n=14):
-    diff = series.diff()
-    up, dn = diff.clip(lower=0), -diff.clip(upper=0)
-    ma_up = up.ewm(alpha=1/n, adjust=False).mean()
-    ma_dn = dn.ewm(alpha=1/n, adjust=False).mean()
-    rs = ma_up / (ma_dn + 1e-12)
-    return 100 - (100/(1+rs))
 
 def make_features(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     c, v = df["close"].astype(float), df["volume"].astype(float)
@@ -234,7 +128,7 @@ def make_features(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     df["atr"]          = (df["high"] - df["low"]).rolling(14).mean()
     df["dd_from_high"] = c / c.rolling(20).max() - 1
     df["ticker"] = ticker
-    return df
+    return df.dropna().reset_index(drop=True)
 
 FEATS = [
     "sma_s","sma_m","sma_l","rsi","ret1","ret5","ret10","vol_chg",
@@ -242,12 +136,15 @@ FEATS = [
     "spy_ret","qqq_ret","vix_ret","vol_ma_ratio","momentum20","atr","dd_from_high"
 ]
 
-# ====== DATA ======
-def load_market_index(start, end):
-    idx = ["SPY","QQQ","^VIX"]
-    data = yf.download(idx, start=start, end=end, auto_adjust=True, group_by='ticker', threads=True, progress=False)
+# =========================
+# 市場データ
+# =========================
+def load_market_index():
+    idx_list = ["SPY","QQQ","^VIX"]
+    data = yf.download(idx_list, start=START, end=END, auto_adjust=True,
+                       group_by='ticker', threads=True, progress=False)
     if isinstance(data.columns, pd.MultiIndex):
-        close = data.xs("Close", axis=1, level=1)
+        close = data.xs('Close', axis=1, level=1)
     else:
         close = data["Close"].to_frame()
     close = close.rename(columns={"SPY":"spy","QQQ":"qqq","^VIX":"vix"})
@@ -256,244 +153,250 @@ def load_market_index(start, end):
     rets["date"] = pd.to_datetime(rets["date"])
     return rets
 
-def load_all_data_fast(tickers, start, end):
+def load_all_data_fast(tickers):
     print(f"Downloading {len(tickers)} tickers in batch...")
-    data = yf.download(tickers, start=start, end=end, auto_adjust=True,
+    data = yf.download(tickers, start=START, end=END, auto_adjust=True,
                        group_by='ticker', threads=True, progress=False)
-    market = load_market_index(start, end)
-    rows = []
+    market = load_market_index()
+    out = []
+    is_multi = isinstance(data.columns, pd.MultiIndex)
     for t in tickers:
         try:
-            if isinstance(data.columns, pd.MultiIndex):
-                if t not in data.columns.levels[0]:
-                    print(f"⚠ Missing: {t}"); continue
+            if is_multi:
+                if t not in data.columns.get_level_values(0):
+                    print(f"⚠ データ無し: {t}")
+                    continue
                 df = data[t].copy().reset_index()
                 df.columns = [c.lower() for c in df.columns]
             else:
                 df = data.copy().reset_index()
                 df.columns = [c.lower() for c in df.columns]
+
             need = {"date","open","high","low","close","volume"}
             if not need.issubset(df.columns):
-                print(f"⚠ Columns missing: {t}"); continue
-            feat = make_features(df[list(need)], t).dropna()
+                print(f"⚠ 欠損列: {t}")
+                continue
+
+            feat = make_features(df[list(need)], t)
             merged = pd.merge(feat, market, on="date", how="left")
-            rows.append(merged)
+            out.append(merged)
         except Exception as e:
             print(f"⚠ {t}: {e}")
-    if not rows: raise RuntimeError("No data.")
-    all_df = pd.concat(rows, ignore_index=True).sort_values(["date","ticker"]).reset_index(drop=True)
-    all_df["date"] = pd.to_datetime(all_df["date"])
+            continue
+    if not out:
+        raise RuntimeError("No price data fetched. Check tickers or network.")
+    all_df = pd.concat(out, ignore_index=True).sort_values(["date","ticker"]).reset_index(drop=True)
     return all_df
 
-# ====== LABELS ======
+# =========================
+# 学習・推論・評価
+# =========================
 def add_future_labels_inplace(df: pd.DataFrame):
     for n in [1,3,5]:
-        df[f"ret_next{n}"] = df.groupby("ticker")["close"].shift(-n)/df["close"] - 1
+        df[f"ret_next{n}"] = df.groupby("ticker")["close"].shift(-n) / df["close"] - 1
         df[f"label{n}"] = (df[f"ret_next{n}"] > 0).astype(int)
     return df
 
-# ====== MODEL ======
-def _lgb_params(device_try_gpu=True, **over):
-    params = {
-        "objective":"binary","metric":"auc","boosting_type":"gbdt",
-        "random_state":CFG["RANDOM_SEED"],"verbosity":-1,
-        "learning_rate":CFG["LGBM"]["learning_rate"],
-        "num_leaves":CFG["LGBM"]["num_leaves"],
-        "n_estimators":CFG["LGBM"]["n_estimators"],
-        "max_depth":CFG["LGBM"]["max_depth"],
-    }
-    params.update(over)
-    if device_try_gpu:
-        try:
-            params["device_type"] = "gpu"
-            _ = lgb.train(params, lgb.Dataset(np.zeros((5,3)), label=np.zeros(5)))
-        except Exception:
-            params.pop("device_type", None)
-    return params
+def train_one_model(train_df, target_col, params):
+    df = train_df.dropna(subset=[target_col])
+    if df.empty: return None
+    X, y = df[FEATS], df[target_col].astype(int)
+    return lgb.train(params, lgb.Dataset(X, label=y))
 
-def train_models(train_df: pd.DataFrame):
+def train_models(train_df):
     params = _lgb_params(device_try_gpu=True)
-    models = {}
-    for n in [1,3,5]:
-        sub = train_df.dropna(subset=[f"label{n}"])
-        if sub.empty: continue
-        X, y = sub[FEATS], sub[f"label{n}"]
-        models[n] = lgb.train(params, lgb.Dataset(X, label=y))
-    return models
+    return {"m1": train_one_model(train_df, "label1", params),
+            "m3": train_one_model(train_df, "label3", params),
+            "m5": train_one_model(train_df, "label5", params)}
 
-def predict_ensemble(models: dict, df: pd.DataFrame):
+def predict_models(models, df):
     X = df[FEATS]
-    preds, ws = [], []
-    for n, w in zip([1,3,5],[0.5,0.3,0.2]):
-        if n in models:
-            preds.append(models[n].predict(X))
-            ws.append(w)
-    if not preds: return np.zeros(len(df))
-    return np.average(np.vstack(preds), axis=0, weights=ws)
-
-# ====== UTILS ======
-def softmax(x, temp=1.0):
-    x = np.array(x, dtype=float)
-    x = x - np.max(x)
-    z = np.exp(x/float(temp))
-    p = z / (z.sum() + 1e-12)
-    return p
-
-def load_sector_map(path):
-    if path and os.path.exists(path):
-        df = pd.read_csv(path)
-        m = dict(zip(df["ticker"], df["sector"]))
-        return m
-    return {}
-
-def apply_sector_cap(rows, max_per_sector, sector_map):
-    if not max_per_sector or max_per_sector is None:
-        return rows
-    used = {}
-    kept = []
-    for r in rows:
-        sec = sector_map.get(r["ticker"], "UNKNOWN")
-        used[sec] = used.get(sec, 0) + 1
-        if used[sec] <= max_per_sector:
-            kept.append(r)
-    return kept
-
-def post_discord(webhook, title, lines):
-    if not webhook: 
-        print("(Discord webhook not set; skip)"); return
-    content = f"📊 **{title}**\n" + "\n".join(lines)
-    r = requests.post(webhook, json={"content": content})
-    print("Discord:", "OK" if r.status_code in (200,204) else f"NG {r.status_code}: {r.text}")
-
-# ====== CORE RUNNER ======
-def run_production_day():
-    start, end = CFG["START"], CFG["END"]
-    # 1) データ
-    all_df = load_all_data_fast(ALL_TICKERS, start, end)
-    last_day = all_df["date"].max()
-    train_start = last_day - pd.DateOffset(months=CFG["TRAIN_MONTHS"])
-    tr = all_df[(all_df["date"]>=train_start) & (all_df["date"]<=last_day)].copy()
-
-    # 2) ラベル（未来遮断）
-    add_future_labels_inplace(tr)
-
-    # 3) 学習
-    models = train_models(tr)
-
-    # 4) 予測（最新日＝翌営業日用）
-    today_df = all_df[all_df["date"]==last_day].copy()
-    today_df["prob"] = predict_ensemble(models, today_df)
-
-    # 5) スコア要約
-    mean_prob = float(today_df["prob"].mean())
-    top = today_df.sort_values("prob", ascending=False).head(CFG["TOP_K"]).copy()
-
-    # 6) 参戦判定（休む/戦う）
-    go_trade = (mean_prob >= CFG["PROB_TH"])
-    if not go_trade:
-        msg = f"平均prob={mean_prob:.3f} < TH={CFG['PROB_TH']:.2f} → 本日ノーポジ"
-        print(msg)
-
-    # 7) ソフトマックス配分
-    pick_rows = [{"ticker": r.ticker, "prob": float(r.prob), "close": float(r.close)} 
-                 for _, r in top.iterrows()]
-    # セクター制限
-    sector_map = load_sector_map(CFG["SECTOR_MAP_CSV"])
-    pick_rows = apply_sector_cap(pick_rows, CFG["MAX_PER_SECTOR"], sector_map)
-
-    probs = [r["prob"] for r in pick_rows]
-    if len(probs)==0 or not go_trade:
-        weights = np.zeros(len(pick_rows))
-    else:
-        weights = softmax(probs, temp=CFG["SOFTMAX_TEMP"])
-        # 極小ウェイト切り捨て・正規化
-        weights = np.where(weights >= CFG["MIN_WEIGHT_CUT"], weights, 0.0)
-        s = weights.sum()
-        weights = weights / s if s>0 else weights
-
-    # 8) 実際の資金配分（上限適用）
-    allocs = []
-    gross = 0.0
-    for w, r in zip(weights, pick_rows):
-        w = min(w, CFG["POSITION_CAP_PCT"])
-        allocs.append({"ticker": r["ticker"], "weight": float(w), "prob": r["prob"], "close": r["close"]})
-        gross += w
-    # 総和が MAX_GROSS_EXPOSURE を超えるなら縮小
-    if gross > 0 and gross > CFG["MAX_GROSS_EXPOSURE"]:
-        scale = CFG["MAX_GROSS_EXPOSURE"] / gross
-        for a in allocs: a["weight"] *= scale
-        gross = CFG["MAX_GROSS_EXPOSURE"]
-
-    # 9) 発注リスト作成（理論口数）
-    orders = []
-    for a in allocs:
-        notional = CFG["DAILY_CAPITAL"] * a["weight"]
-        px = a["close"] * (1 + CFG["SLIPPAGE"])  # 成行前提の控えめ約定想定
-        qty = math.floor(notional / px) if px>0 else 0
-        if qty <= 0: 
-            continue
-        orders.append({
-            "ticker": a["ticker"],
-            "target_weight": round(a["weight"], 4),
-            "prob": round(a["prob"], 4),
-            "price_assumed": round(px, 2),
-            "qty": int(qty),
-            "notional": round(qty * px, 2),
-        })
-
-    # 10) 保存 & 通知
-    stamp = str(last_day.date())
-    out_dir = CFG["OUT_DIR"]
-    # Signals CSV
-    if CFG["SAVE_SIGNALS_CSV"]:
-        sig_cols = ["ticker","prob","close","rsi","ma_gap","volatility"]
-        sig_df = today_df.sort_values("prob", ascending=False)[sig_cols].head(20).copy()
-        sig_df["prob"] = sig_df["prob"].round(4)
-        sig_path = os.path.join(out_dir, f"signals_{stamp}.csv")
-        sig_df.to_csv(sig_path, index=False)
-        print("Saved:", sig_path)
-    # Orders CSV
-    if CFG["SAVE_ORDERS_CSV"]:
-        ord_df = pd.DataFrame(orders)
-        ord_path = os.path.join(out_dir, f"orders_{stamp}.csv")
-        ord_df.to_csv(ord_path, index=False)
-        print("Saved:", ord_path)
-    # Summary JSON
-    summary = {
-        "date": stamp,
-        "go_trade": go_trade,
-        "mean_prob": round(mean_prob, 4),
-        "top_k": CFG["TOP_K"],
-        "gross_exposure": round(float(sum(a["target_weight"] for a in orders)), 4) if orders else 0.0,
-        "daily_capital": CFG["DAILY_CAPITAL"],
-        "orders_count": len(orders),
+    return {
+        "p1": models["m1"].predict(X) if models["m1"] else np.zeros(len(df)),
+        "p3": models["m3"].predict(X) if models["m3"] else np.zeros(len(df)),
+        "p5": models["m5"].predict(X) if models["m5"] else np.zeros(len(df)),
     }
-    if CFG["SAVE_SUMMARY_JSON"]:
-        js_path = os.path.join(out_dir, f"summary_{stamp}.json")
-        with open(js_path, "w") as f: json.dump(summary, f, indent=2)
-        print("Saved:", js_path)
 
-    # Discord
-    lines = [
-        f"日時(JST): {datetime.datetime.now(TZ).strftime('%Y-%m-%d %H:%M')}",
-        f"データ最終日: {stamp}",
-        f"学習窓: {CFG['TRAIN_MONTHS']}ヶ月 | 参戦TH: {CFG['PROB_TH']:.2f} | 平均prob: {mean_prob:.3f}",
-        f"TOP_K: {CFG['TOP_K']} | 温度T: {CFG['SOFTMAX_TEMP']:.2f} | セク上限: {CFG['MAX_PER_SECTOR']}",
-        "—— 発注候補 ——" if orders else "—— 本日ノーポジ ——",
-    ]
-    for o in orders[:10]:
-        lines.append(f"{o['ticker']} | w={o['target_weight']:.3f} | prob={o['prob']:.3f} | qty={o['qty']} @ ${o['price_assumed']:.2f}")
-    lines.append(f"総エクスポージャー(理論): {summary['gross_exposure']:.3f}")
-    if CFG["SAVE_SIGNALS_CSV"]: lines.append(f"Signals: {sig_path}")
-    if CFG["SAVE_ORDERS_CSV"]:  lines.append(f"Orders:  {ord_path}")
-    if CFG["SAVE_SUMMARY_JSON"]:lines.append(f"Summary: {js_path}")
-    post_discord(CFG["DISCORD_WEBHOOK"], "AI株式シミュレーター 実運用レポート", lines)
+def fit_calibrator(y_true, p_raw, method="isotonic"):
+    y_true, p_raw = np.asarray(y_true), np.asarray(p_raw)
+    m = ~np.isnan(y_true) & ~np.isnan(p_raw)
+    y_true, p_raw = y_true[m], p_raw[m]
+    if len(y_true) < 20: return None
+    if method=="isotonic":
+        iso = IsotonicRegression(out_of_bounds="clip"); iso.fit(p_raw, y_true); return ("isotonic", iso)
+    lr = LogisticRegression(max_iter=1000); lr.fit(p_raw.reshape(-1,1), y_true.astype(int)); return ("platt", lr)
 
-    return {"orders": orders, "summary": summary}
+def apply_calibrator(calib, p_raw):
+    if calib is None: return p_raw
+    kind, model = calib
+    p_raw = np.asarray(p_raw)
+    return model.transform(p_raw) if kind=="isotonic" else model.predict_proba(p_raw.reshape(-1,1))[:,1]
 
-# ====== RUN ======
-res = run_production_day()
-res
+def estimate_mu_by_fold(train_df):
+    mu = {}
+    for k in ["1","3","5"]:
+        lab, ret = train_df[f"label{k}"], train_df[f"ret_next{k}"]
+        m = (lab == 1) & (~ret.isna())
+        mu[k] = float(ret[m].mean()) if m.any() else 0.0
+        if not np.isfinite(mu[k]): mu[k] = 0.0
+    return mu
+
+def softmax_alloc(p, temp=SOFTMAX_TEMP, min_w=MIN_WEIGHT_CUT):
+    x = np.clip(np.asarray(p, dtype=float), 1e-9, 1-1e-9) / max(1e-6, temp)
+    w = np.exp(x - x.max()); w /= w.sum()
+    return w
+
+# =========================
+# バックテスト & ウォークフォワード
+# =========================
+def backtest_pxmu_daily(df, top_k=TOP_K, initial_capital=INIT_CAPITAL):
+    g = df.sort_values(["date","score"], ascending=[True,False]).groupby("date")
+    eq_vals, dates, cap = [], [], float(initial_capital)
+    for d, sub in g:
+        sub = sub.dropna(subset=["ret_chosen","score"])
+        if sub.empty: continue
+        ranked = sub.sort_values("score", ascending=False).head(top_k)
+        w = softmax_alloc(ranked["score"].values, temp=SOFTMAX_TEMP)
+        r = np.clip(ranked["ret_chosen"].values, RET_CLIP_LOW, RET_CLIP_HIGH) - 2*COMMISSION
+        day_ret = np.sum(w * r) * PER_POS_FRAC
+        cap *= (1 + day_ret)
+        dates.append(d); eq_vals.append(cap)
+    return pd.Series(eq_vals, index=pd.to_datetime(dates))
+
+def walk_forward(all_df):
+    df = all_df.copy()
+    df["date"] = pd.to_datetime(df["date"])
+    months = pd.date_range(df["date"].min(), df["date"].max(), freq="MS")[TRAIN_MONTHS:]
+    equity_all, cap = [], INIT_CAPITAL
+    for ms in months:
+        train_start = ms - pd.DateOffset(months=TRAIN_MONTHS)
+        train_end   = ms - pd.DateOffset(days=1)
+        test_start  = ms
+        test_end    = ms + pd.DateOffset(months=TEST_MONTHS) - pd.DateOffset(days=1)
+
+        tr = df[(df["date"]>=train_start)&(df["date"]<=train_end)].copy()
+        te = df[(df["date"]>=test_start)&(df["date"]<=test_end)].copy()
+        if len(tr)<300 or len(te)<20: continue
+
+        add_future_labels_inplace(tr)
+        add_future_labels_inplace(te)
+
+        models = train_models(tr)
+        mu = estimate_mu_by_fold(tr)
+
+        # validation = train末30日
+        val_end = tr["date"].max()
+        val_start = val_end - pd.DateOffset(days=30)
+        val = tr[tr["date"].between(val_start, val_end)].copy()
+
+        p_val_raw = predict_models(models, val)
+        p_te_raw  = predict_models(models, te)
+
+        if USE_CALIBRATION:
+            calib1 = fit_calibrator(val["label1"], p_val_raw["p1"], method=CALIB_METHOD)
+            calib3 = fit_calibrator(val["label3"], p_val_raw["p3"], method=CALIB_METHOD)
+            calib5 = fit_calibrator(val["label5"], p_val_raw["p5"], method=CALIB_METHOD)
+            p_te = {"p1": apply_calibrator(calib1, p_te_raw["p1"]),
+                    "p3": apply_calibrator(calib3, p_te_raw["p3"]),
+                    "p5": apply_calibrator(calib5, p_te_raw["p5"])}
+        else:
+            p_te = p_te_raw
+
+        score_best = np.vstack([p_te["p1"]*mu["1"], p_te["p3"]*mu["3"], p_te["p5"]*mu["5"]]).T
+        best_idx = np.argmax(score_best, axis=1)
+        best_score = score_best.max(axis=1)
+
+        te_use = te.copy()
+        te_use["score"] = best_score
+        te_use["ret_chosen"] = np.where(best_idx==0, te_use["ret_next1"],
+                                 np.where(best_idx==1, te_use["ret_next3"], te_use["ret_next5"]))
+        thr = np.quantile(best_score, FIXED_SCORE_QUANTILE)
+        te_use = te_use[te_use["score"] >= (thr - 1e-12)]
+
+        eq = backtest_pxmu_daily(te_use[["date","ticker","score","ret_chosen"]], top_k=TOP_K, initial_capital=cap)
+        if len(eq.dropna())>1:
+            equity_all.append(eq.dropna())
+            cap = float(eq.iloc[-1])
+
+    return (pd.concat(equity_all).sort_index() if equity_all else pd.Series(dtype=float))
+
+# =========================
+# ログ & 結果処理
+# =========================
+def summarize(eq: pd.Series):
+    eq = eq.dropna()
+    if len(eq)<2:
+        return (np.nan, np.nan, np.nan)
+    total = float(eq.iloc[-1]) / float(eq.iloc[0]) - 1
+    dr = eq.pct_change().dropna()
+    sharpe = (dr.mean()/(dr.std()+1e-12))*np.sqrt(252) if len(dr)>1 else np.nan
+    maxdd = ((eq.cummax()-eq)/eq.cummax()).max() if len(eq)>1 else np.nan
+    return total, sharpe, maxdd
+
+def log_performance(eq: pd.Series):
+    dr = eq.pct_change().dropna()
+    if len(dr)==0:
+        print("No daily returns"); return
+    annual_ret = (1 + dr.mean())**252 - 1
+    annual_vol = dr.std() * np.sqrt(252)
+    print(f"平均日利: {dr.mean()*100:.3f}% | 年利: {annual_ret:.2%} | 年率ボラ: {annual_vol:.2%}")
+
+# =========================
+# Discord通知
+# =========================
+def notify_discord(result_text: str):
+    url = os.getenv("DISCORD_WEBHOOK_URL")
+    if not url:
+        print("⚠️ No Discord webhook URL found. Skipping notification.")
+        return
+    payload = {
+        "username": "AI Stock Bot",
+        "embeds": [{
+            "title": "📊 AIシミュレーター日次結果",
+            "description": result_text,
+            "color": 0x2ECC71
+        }]
+    }
+    try:
+        requests.post(url, json=payload, timeout=15)
+        print("✅ Discord通知送信完了")
+    except Exception as e:
+        print(f"❌ Discord送信失敗: {e}")
+
+# =========================
+# 実行（Discord通知：前日比・収益額・累計）
+# =========================
+def main():
+    all_df = load_all_data_fast(ALL_TICKERS)
+    print(f"全データ件数: {len(all_df)}; 期間: {all_df['date'].min().date()} ～ {all_df['date'].max().date()}")
+    eq = walk_forward(all_df)
+    r, s, d = summarize(eq)
+    print("\n=== Walk-Forward 総合結果（6m→1m｜Aggressive） ===")
+    print(f"Return={r:.4f}, Sharpe={s:.4f}, MaxDD={d:.4f}")
+    log_performance(eq)
+    return eq, r, s, d
+
+if __name__ == "__main__":
+    eq, r, s, d = main()
+    if eq is not None and len(eq) > 1:
+        last_val = float(eq.iloc[-1])
+        prev_val = float(eq.iloc[-2])
+        daily_change_pct = (last_val / prev_val - 1.0) * 100.0
+        daily_profit = last_val - prev_val
+        total_profit = last_val - INIT_CAPITAL
+        icon = "📈" if daily_profit >= 0 else "📉"
+
+        result = (
+            f"**Return:** {r:.4f} (累計)\n"
+            f"**Sharpe:** {s:.4f}\n"
+            f"**MaxDD:** {d:.4f}\n"
+            f"**前日比:** {daily_change_pct:+.2f}% （{daily_profit:+,.0f}円） {icon}\n"
+            f"**累計損益:** {total_profit:+,.0f}円"
+        )
+        notify_discord(result)
+    else:
+        print("⚠️ Equityデータが不十分のためDiscord通知スキップ")
+
 
 
 
