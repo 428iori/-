@@ -1,27 +1,32 @@
 # -*- coding: utf-8 -*-
 """
-実運用版 AI株式シミュレーター起動スクリプト（Discord通知付き）
+実運用版 AI株式シミュレーター（自動実行 + Discord通知 + LightGBMウォークフォワード）
 """
 
-import yfinance as yf
-import lightgbm as lgb
+import os, datetime, pytz, requests, traceback
 import pandas as pd
 import numpy as np
-import requests
-import pytz
-import os
+import yfinance as yf
+import lightgbm as lgb
+from sklearn.metrics import roc_auc_score
 
 # ===== 設定 =====
 CFG = {
     "TIMEZONE": "Asia/Tokyo",
     "START_CAPITAL": 1_000_000,
+    "PROB_TH": 0.58,
+    "TOP_K": 5,
+    "TRAIN_MONTHS": 6,
+    "TEST_MONTHS": 1,
+    "START": "2015-01-01",
+    "END": None,
 }
 
-# ===== Discord通知 =====
+# ===== Discord通知関数 =====
 def notify_discord(msg: str):
     url = os.environ.get("DISCORD_WEBHOOK_URL")
     if not url:
-        print("⚠️ Discord Webhook URLが設定されていません。")
+        print("⚠️ Webhook未設定")
         return
     payload = {"content": msg}
     try:
@@ -31,15 +36,84 @@ def notify_discord(msg: str):
     except Exception as e:
         print(f"❌ Discord通知失敗: {e}")
 
-# ===== メイン処理 =====
+# ===== RSIなど特徴量 =====
+def rsi(series, n=14):
+    diff = series.diff()
+    up = diff.clip(lower=0)
+    dn = -diff.clip(upper=0)
+    ma_up = up.ewm(alpha=1/n, adjust=False).mean()
+    ma_dn = dn.ewm(alpha=1/n, adjust=False).mean()
+    rs = ma_up / (ma_dn + 1e-12)
+    return 100 - (100 / (1 + rs))
+
+def make_features(df):
+    c = df["Close"]
+    df["ret1"] = c.pct_change()
+    df["ret5"] = c.pct_change(5)
+    df["rsi"] = rsi(c)
+    df["volatility"] = c.pct_change().rolling(20).std()
+    df["sma10"] = c.rolling(10).mean()
+    df["sma30"] = c.rolling(30).mean()
+    df["ma_gap"] = (c - df["sma30"]) / (df["sma30"] + 1e-12)
+    df = df.dropna()
+    return df
+
+# ===== データ取得 =====
+def load_data():
+    tickers = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META"]
+    data = yf.download(tickers, start=CFG["START"], end=CFG["END"], group_by="ticker", threads=True)
+    out = []
+    for t in tickers:
+        df = data[t].reset_index().dropna()
+        df["Ticker"] = t
+        df = make_features(df)
+        out.append(df)
+    return pd.concat(out)
+
+# ===== ラベル生成 =====
+def add_labels(df):
+    df["ret_next1"] = df.groupby("Ticker")["Close"].shift(-1) / df["Close"] - 1
+    df["label"] = (df["ret_next1"] > 0.002).astype(int)
+    return df.dropna()
+
+# ===== 学習 & テスト =====
+def train_lgb(train_df):
+    feats = ["ret1","ret5","rsi","volatility","ma_gap"]
+    X = train_df[feats]; y = train_df["label"]
+    params = {"objective":"binary","learning_rate":0.03,"num_leaves":15,"n_estimators":100,"verbosity":-1}
+    return lgb.train(params, lgb.Dataset(X, label=y))
+
+def backtest(df, model):
+    feats = ["ret1","ret5","rsi","volatility","ma_gap"]
+    df["prob"] = model.predict(df[feats])
+    top = df.groupby("Date").apply(lambda g: g.nlargest(CFG["TOP_K"], "prob"))
+    mean_ret = top["ret_next1"].mean()
+    return mean_ret
+
+# ===== メイン =====
 def main():
+    tz = pytz.timezone(CFG["TIMEZONE"])
     now = datetime.datetime.now(tz)
-    msg = f"🚀 実運用AIシミュレーターを起動しました。\n時刻: {now.strftime('%Y-%m-%d %H:%M:%S')}"
-    print(msg)
-    notify_discord(msg)
+    notify_discord(f"🚀 AIシミュレーター自動起動 ({now.strftime('%Y-%m-%d %H:%M:%S')})")
+
+    try:
+        df = load_data()
+        df = add_labels(df)
+        split = int(len(df)*0.8)
+        tr, te = df.iloc[:split], df.iloc[split:]
+        model = train_lgb(tr)
+        mean_ret = backtest(te, model)
+        msg = f"✅ 実行完了\n平均日次リターン: {mean_ret*100:.2f}%"
+        print(msg)
+        notify_discord(msg)
+    except Exception as e:
+        err = traceback.format_exc()
+        notify_discord(f"❌ 実行中エラー\n{e}\n```\n{err}\n```")
+        raise
 
 if __name__ == "__main__":
     main()
+
 
 
 
@@ -397,6 +471,7 @@ def run_production_day():
 # ====== RUN ======
 res = run_production_day()
 res
+
 
 
 
