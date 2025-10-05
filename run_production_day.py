@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-実運用版 AI株式シミュレーター（自動実行 + Discord通知 + LightGBMウォークフォワード）
+実運用版 AI株式シミュレーター（当日収益表示 + Discord通知）
 """
 
 import os, datetime, pytz, requests, traceback
@@ -103,9 +103,21 @@ def main():
         tr, te = df.iloc[:split], df.iloc[split:]
         model = train_lgb(tr)
         mean_ret = backtest(te, model)
-        msg = f"✅ 実行完了\n平均日次リターン: {mean_ret*100:.2f}%"
+
+        # === 収益計算 ===
+        today_return = mean_ret
+        capital = CFG["START_CAPITAL"] * (1 + today_return)
+        profit = capital - CFG["START_CAPITAL"]
+
+        msg = (
+            f"✅ 実行完了\n"
+            f"平均日次リターン: {today_return*100:+.2f}%\n"
+            f"本日の収益: {profit:+.0f}円\n"
+            f"累計資産: {capital:,.0f}円"
+        )
         print(msg)
         notify_discord(msg)
+
     except Exception as e:
         err = traceback.format_exc()
         notify_discord(f"❌ 実行中エラー\n{e}\n```\n{err}\n```")
@@ -113,6 +125,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
@@ -471,6 +484,7 @@ def run_production_day():
 # ====== RUN ======
 res = run_production_day()
 res
+
 
 
 
