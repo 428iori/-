@@ -1,13 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-安全版フル実行スクリプト：
-- 翌寄付き約定（next-open）優先、フォールバック（当日終値→直近available）
-- 売却ログ強化（売却発生 / スキップ理由 を必ず通知＆CSVに出力）
-- 既存の equity_state.json / equity_log.csv を尊重・初期化（無ければ作成）
-- 例外時も CSV にエラーログを残す
-- JST（Asia/Tokyo）基準、土日スキップ（ただしスキップ行はログに残す）
+AI株式シミュレーター（翌寄付き約定 + 売却ログ強化 + 日次CSV）
+- 翌寄付き(next-open)を優先して約定。なければ当日終値、さらに過去価格をフォールバック。
+- 売却が実行された or スキップされた理由を必ず通知/CSVに残すパッチ適用済み
+- 土日スキップ（JST）
 """
-import os, json, datetime, traceback, requests
+import os, json, datetime, warnings, requests
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -16,9 +14,11 @@ import lightgbm as lgb
 from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LogisticRegression
 
-# -------------------
-# Config
-# -------------------
+warnings.filterwarnings("ignore")
+
+# =========================
+# 設定（調整可）
+# =========================
 START = "2015-01-01"
 END = None
 RANDOM_SEED = 42
@@ -30,17 +30,22 @@ COMMISSION = 0.0005
 FIXED_SCORE_QUANTILE = 0.50
 SOFTMAX_TEMP = 0.15
 RET_CLIP_LOW, RET_CLIP_HIGH = -0.08, 0.30
-SLIPPAGE = 0.0002   # 0.02%
 
-# Files / endpoints
+# SLIPPAGE: 約定での価格悪化（例 0.0002 = 0.02%）
+SLIPPAGE = 0.0002
+
+# ログ/ファイル
+ENABLE_CSV_LOG = True
 LOG_FILE = Path("equity_log.csv")
 STATE_FILE = Path("equity_state.json")
+
+# Discord
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
-# Behavior
-DEBUG = True
+# デバッグ（本番は False）
+DEBUG = False
 
-# Universe (adjust as needed)
+# ユニバース（必要に応じて編集）
 ALL_TICKERS = [
     "AAPL","MSFT","GOOGL","AMZN","META","NVDA","TSLA","AMD","NFLX","ADBE",
     "CRM","INTC","IBM","ORCL","QCOM","AVGO","CSCO","TXN","MU","SHOP",
@@ -54,86 +59,9 @@ ALL_TICKERS = [
     "MRK","BMY","LLY","UNH","CI","HUM","CVS","TMO","DHR","MDT"
 ]
 
-TZ = datetime.timezone(datetime.timedelta(hours=9))  # JST
-
-# -------------------
-# Utilities: safe file ops & logging
-# -------------------
-def safe_write_json(path: Path, data):
-    tmp = path.with_suffix(".tmp.json")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    tmp.replace(path)
-
-def ensure_files_exist():
-    # state
-    if not STATE_FILE.exists():
-        init_state = {"capital": INIT_CAPITAL, "positions": []}
-        safe_write_json(STATE_FILE, init_state)
-        print(f"[INIT] created {STATE_FILE}")
-    # log
-    if not LOG_FILE.exists():
-        header = {
-            "run_date_jst": datetime.datetime.now(TZ).date().isoformat(),
-            "market_date": "",
-            "status": "init",
-            "realized_pnl": 0.0,
-            "unrealized_pnl": 0.0,
-            "equity": float(INIT_CAPITAL),
-            "capital": float(INIT_CAPITAL),
-            "num_positions": 0,
-            "positions": "",
-            "buys": "",
-            "sells": "",
-            "daily_return_pct": 0.0,
-            "error": ""
-        }
-        pd.DataFrame([header]).to_csv(LOG_FILE, index=False)
-        print(f"[INIT] created {LOG_FILE}")
-
-def append_daily_log(row: dict):
-    try:
-        header = not LOG_FILE.exists()
-        pd.DataFrame([row]).to_csv(LOG_FILE, mode="a", index=False, header=header)
-    except Exception as e:
-        # fallback robust append
-        try:
-            if LOG_FILE.exists():
-                prev = pd.read_csv(LOG_FILE)
-            else:
-                prev = pd.DataFrame()
-        except Exception:
-            prev = pd.DataFrame()
-        new = pd.concat([prev, pd.DataFrame([row])], ignore_index=True)
-        new.to_csv(LOG_FILE, index=False)
-
-def load_state():
-    if not STATE_FILE.exists():
-        return {"capital": INIT_CAPITAL, "positions": []}
-    try:
-        return json.load(open(STATE_FILE, "r", encoding="utf-8"))
-    except Exception:
-        return {"capital": INIT_CAPITAL, "positions": []}
-
-def save_state(state):
-    try:
-        safe_write_json(STATE_FILE, state)
-    except Exception as e:
-        print("[WARN] failed to save state:", e)
-
-def notify_discord(msg):
-    if not DISCORD_WEBHOOK_URL:
-        print(msg)
-        return
-    try:
-        requests.post(DISCORD_WEBHOOK_URL, json={"content": msg}, timeout=5)
-    except Exception as e:
-        print("[WARN] Discord notify failed:", e)
-        print(msg)
-
-# -------------------
-# Features / model helpers
-# -------------------
+# =========================
+# ヘルパー（特徴量等）
+# =========================
 def rsi(series, n=14):
     diff = series.diff()
     up = diff.clip(lower=0)
@@ -145,6 +73,7 @@ def rsi(series, n=14):
 
 def make_features(df, ticker):
     c = df["close"].astype(float)
+    v = df["volume"].astype(float) if "volume" in df.columns else pd.Series(np.nan, index=df.index)
     df["sma_s"] = c.rolling(10).mean()
     df["sma_m"] = c.rolling(30).mean()
     df["sma_l"] = c.rolling(90).mean()
@@ -158,8 +87,11 @@ def make_features(df, ticker):
 
 FEATS = ["sma_s","sma_m","sma_l","rsi","ret1","ret5","volatility","ma_gap"]
 
+# =========================
+# データ取得
+# =========================
 def load_all_data_fast(tickers):
-    print(f"[DATA] downloading {len(tickers)} tickers...")
+    print(f"Downloading {len(tickers)} tickers...")
     raw = yf.download(tickers, start=START, end=END, auto_adjust=True, group_by='ticker', threads=True, progress=False)
     out = []
     for t in tickers:
@@ -168,9 +100,9 @@ def load_all_data_fast(tickers):
                 if t not in raw.columns.levels[0]:
                     if DEBUG: print(f"[WARN] no data for {t}")
                     continue
-                df = raw[t].reset_index()
+                df = raw[t].copy().reset_index()
             else:
-                df = raw.reset_index()
+                df = raw.copy().reset_index()
             df.columns = [c.lower() for c in df.columns]
             need = {"date","open","high","low","close","volume"}
             if not need.issubset(set(df.columns)):
@@ -179,14 +111,17 @@ def load_all_data_fast(tickers):
             feat = make_features(df, t)
             out.append(feat)
         except Exception as e:
-            if DEBUG: print("[ERR]", t, e)
+            if DEBUG: print(f"[ERR] {t}: {e}")
             continue
     if not out:
         raise RuntimeError("No data fetched.")
     all_df = pd.concat(out, ignore_index=True).sort_values(["date","ticker"]).reset_index(drop=True)
-    print(f"[DATA] rows={len(all_df)}  period: {all_df['date'].min().date()} ~ {all_df['date'].max().date()}")
+    print(f"Data rows: {len(all_df)}  period: {all_df['date'].min().date()} ~ {all_df['date'].max().date()}")
     return all_df
 
+# =========================
+# ラベル / モデル
+# =========================
 def add_future_labels_inplace(df):
     for n in [1,3,5]:
         df[f"ret_next{n}"] = df.groupby("ticker")["close"].shift(-n) / df["close"] - 1
@@ -223,29 +158,96 @@ def estimate_mu(df):
         mu[k] = pos.mean() if len(pos)>0 else 0.0
     return mu
 
+# =========================
+# 状態管理 / 通知 / CSV
+# =========================
+def load_state():
+    if not STATE_FILE.exists():
+        return {"capital": INIT_CAPITAL, "positions": []}
+    try:
+        return json.load(open(STATE_FILE, "r", encoding="utf-8"))
+    except Exception:
+        return {"capital": INIT_CAPITAL, "positions": []}
+
+def save_state(state):
+    json.dump(state, open(STATE_FILE, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
+
+def notify_discord(msg):
+    if not DISCORD_WEBHOOK_URL:
+        print(msg)
+        return
+    try:
+        requests.post(DISCORD_WEBHOOK_URL, json={"content": msg}, timeout=5)
+    except Exception as e:
+        print(f"[WARN] Discord notify failed: {e}")
+        print(msg)
+
+def append_daily_log(run_date_jst, market_date, realized, unrealized, equity, capital, positions, buys, sells):
+    if not ENABLE_CSV_LOG:
+        return
+    pos_summary = []
+    for p in positions:
+        pos_summary.append(f"{p['ticker']}:{p['hold_days']}/{p.get('held_days',0)}:{int(p['amount'])}")
+    pos_summary_str = ";".join(pos_summary)
+    buys_str = ";".join(buys) if buys else ""
+    sells_str = ";".join(sells) if sells else ""
+
+    prev_equity = None
+    if LOG_FILE.exists():
+        try:
+            prev = pd.read_csv(LOG_FILE)
+            if len(prev)>0:
+                prev_equity = float(prev.iloc[-1]["equity"])
+        except Exception:
+            prev_equity = None
+
+    daily_ret = 0.0
+    if prev_equity is not None and prev_equity != 0:
+        daily_ret = (equity / prev_equity - 1.0) * 100.0
+
+    row = {
+        "run_date_jst": run_date_jst.isoformat(),
+        "market_date": pd.to_datetime(market_date).date().isoformat(),
+        "realized_pnl": float(realized),
+        "unrealized_pnl": float(unrealized),
+        "equity": float(equity),
+        "capital": float(capital),
+        "num_positions": len(positions),
+        "positions": pos_summary_str,
+        "buys": buys_str,
+        "sells": sells_str,
+        "daily_return_pct": float(daily_ret)
+    }
+    dfrow = pd.DataFrame([row])
+    header = not LOG_FILE.exists()
+    dfrow.to_csv(LOG_FILE, mode="a", index=False, header=header)
+
+# =========================
+# 売却フォールバックヘルパー
+# =========================
 def get_last_available_price(all_df_local, ticker, date):
     sub = all_df_local[(all_df_local["ticker"]==ticker) & (all_df_local["date"]<=date)].sort_values("date", ascending=False)
     if not sub.empty:
         return float(sub.iloc[0]["close"])
     return None
 
-# -------------------
-# Core: simulate with next-open + fallback + robust logging
-# -------------------
+# =========================
+# メインロジック（翌寄付き約定・売却ログ強化）
+# =========================
 def simulate_continuous(all_df):
     df = all_df.copy()
     df["date"] = pd.to_datetime(df["date"])
     unique_dates = sorted(df["date"].unique())
     market_date = df["date"].max()
 
-    # detect next trading date
+    # next trading date detection
     try:
         idx_today = unique_dates.index(pd.Timestamp(market_date))
         next_date = unique_dates[idx_today + 1] if idx_today + 1 < len(unique_dates) else None
     except ValueError:
         next_date = None
 
-    # if next_date missing, attempt to fetch a few calendar days after market_date
+    # If next_date missing, attempt to fetch a couple extra calendar days via yfinance
     df_next = pd.DataFrame(columns=df.columns)
     if next_date is None:
         try:
@@ -278,20 +280,23 @@ def simulate_continuous(all_df):
                     next_date = cand_dates[0]
                     df_next = extra_df[extra_df["date"]==next_date].copy()
         except Exception as e:
-            if DEBUG: print("[WARN] next-day fetch failed:", e)
+            if DEBUG: print(f"[WARN] next-day fetch failed: {e}")
             df_next = pd.DataFrame(columns=df.columns)
     else:
         df_next = df[df["date"] == next_date] if next_date is not None else pd.DataFrame(columns=df.columns)
 
-    # prepare train/test
     tr = df[df["date"] >= market_date - pd.DateOffset(months=TRAIN_MONTHS)]
     te = df[df["date"] == market_date]
-    if tr.empty or te.empty:
-        raise RuntimeError("train/test empty")
 
+    if tr.empty or te.empty:
+        print("⚠ データ不足: train/test empty")
+        return
+
+    # maps for fast access
     te_close_map = {r.ticker: float(r.close) for r in te.itertuples()}
-    df_next_open_map = {r.ticker: float(r.open) for r in df_next.itertuples()} if not df_next.empty else {}
-    df_next_close_map = {r.ticker: float(r.close) for r in df_next.itertuples()} if not df_next.empty else {}
+    te_open_map = {r.ticker: float(r.open) for r in te.itertuples()}
+    next_open_map = {r.ticker: float(r.open) for r in df_next.itertuples()} if not df_next.empty else {}
+    next_close_map = {r.ticker: float(r.close) for r in df_next.itertuples()} if not df_next.empty else {}
 
     state = load_state()
     capital = state.get("capital", INIT_CAPITAL)
@@ -303,35 +308,42 @@ def simulate_continuous(all_df):
     remaining = []
 
     if DEBUG:
-        print(f"[DEBUG] market_date={market_date}, next_date={next_date}, old_positions={len(old_positions)}")
+        print(f"[DEBUG] market_date={market_date}, next_date={next_date}, positions_before={len(old_positions)}")
 
-    # SELL: check hold days; priority: next_open -> te_close -> last_available (apply slippage and fees)
+    # ---------- 売却処理（満了）: 優先 next_open -> te_close -> last_available, apply SLIPPAGE & fees ----------
     for pos in old_positions:
         pos["held_days"] = pos.get("held_days", 0) + 1
+        if DEBUG:
+            print(f"[DEBUG] checking pos {pos['ticker']} held_days={pos['held_days']} hold_days={pos['hold_days']}")
         if pos["held_days"] >= pos["hold_days"]:
             sell_price = None
             sell_source = None
-            if next_date is not None and pos["ticker"] in df_next_open_map:
-                sell_price = df_next_open_map[pos["ticker"]] * (1.0 - SLIPPAGE)
+            # 1) next_open
+            if next_date is not None and pos["ticker"] in next_open_map:
+                sell_price = next_open_map[pos["ticker"]] * (1.0 - SLIPPAGE)
                 sell_source = f"next_open({next_date.date()})"
+            # 2) today's close
             elif pos["ticker"] in te_close_map:
                 sell_price = te_close_map[pos["ticker"]] * (1.0 - SLIPPAGE)
                 sell_source = f"te_close({market_date.date()})"
             else:
-                last = get_last_available_price(df, pos["ticker"], market_date)
-                if last is not None:
-                    sell_price = last * (1.0 - SLIPPAGE)
+                last_price = get_last_available_price(df, pos["ticker"], market_date)
+                if last_price is not None:
+                    sell_price = last_price * (1.0 - SLIPPAGE)
                     sell_source = "last_available_before_or_on_market_date"
                 else:
                     sell_price = None
                     sell_source = "no_price_found"
 
             if sell_price is None:
+                # Can't sell — keep position and log reason
                 remaining.append(pos)
                 sells_skipped_for_log.append(f"{pos['ticker']}:skip_no_price")
-                if DEBUG: print(f"[DEBUG] sell skipped {pos['ticker']}")
+                if DEBUG:
+                    print(f"[DEBUG] sell skipped for {pos['ticker']} reason=no_price")
                 continue
 
+            # compute shares, proceeds, subtract fees
             shares = pos["amount"] / pos["buy_price"] if pos["buy_price"] != 0 else 0.0
             proceeds = shares * sell_price
             buy_comm = COMMISSION * pos["amount"]
@@ -339,17 +351,18 @@ def simulate_continuous(all_df):
             profit = proceeds - pos["amount"] - buy_comm - sell_comm
 
             realized_pnl += profit
-            sold_lines.append(f"{pos['ticker']} ({pos['hold_days']}d): {((sell_price/pos['buy_price']-1)*100):+.2f}% ({profit:+,.0f}円) [{sell_source}]")
+            sold_lines.append(f"{pos['ticker']} ({pos['hold_days']}日): {((sell_price/pos['buy_price']-1)*100):+.2f}% ({profit:+,.0f}円) [{sell_source}]")
             sells_for_log.append(f"{pos['ticker']}:profit={profit:+.0f}:src={sell_source}")
         else:
             remaining.append(pos)
 
-    # merge skipped
+    # integrate skipped logs
     if sells_skipped_for_log:
         sells_for_log.extend(sells_skipped_for_log)
+
     capital += realized_pnl
 
-    # BUY: predict on te, pick top by score, determine buy_price by next_open preference
+    # ---------- 新規購入（シグナル:優先 next_open -> te_close -> last_available） ----------
     add_future_labels_inplace(tr)
     add_future_labels_inplace(te)
     models = train_models(tr)
@@ -373,19 +386,20 @@ def simulate_continuous(all_df):
 
             buy_price = None
             buy_source = None
-            if next_date is not None and row.ticker in df_next_open_map:
-                buy_price = df_next_open_map[row.ticker] * (1.0 + SLIPPAGE)
+            if next_date is not None and row.ticker in next_open_map:
+                buy_price = next_open_map[row.ticker] * (1.0 + SLIPPAGE)
                 buy_source = f"next_open({next_date.date()})"
             elif row.ticker in te_close_map:
                 buy_price = te_close_map[row.ticker] * (1.0 + SLIPPAGE)
                 buy_source = f"te_close({market_date.date()})"
             else:
-                lastp = get_last_available_price(df, row.ticker, market_date)
-                if lastp is not None:
-                    buy_price = lastp * (1.0 + SLIPPAGE)
+                last_price = get_last_available_price(df, row.ticker, market_date)
+                if last_price is not None:
+                    buy_price = last_price * (1.0 + SLIPPAGE)
                     buy_source = "last_available_before_or_on_market_date"
                 else:
-                    if DEBUG: print(f"[DEBUG] skipping buy {row.ticker} - no price")
+                    if DEBUG:
+                        print(f"[DEBUG] skipping buy {row.ticker} - no price available")
                     continue
 
             new_positions.append({
@@ -399,7 +413,7 @@ def simulate_continuous(all_df):
 
     all_positions = remaining + new_positions
 
-    # unrealized valuation: use market_date close if available else buy_price
+    # unrealized valuation (use market_date close as conservative valuation)
     unrealized = 0.0
     for pos in all_positions:
         cur_price = te_close_map.get(pos["ticker"], pos["buy_price"])
@@ -407,11 +421,11 @@ def simulate_continuous(all_df):
 
     current_equity = capital + unrealized
 
-    # save state
+    # 状態保存
     state = {"capital": capital, "positions": all_positions}
     save_state(state)
 
-    # ensure sold_lines / sells_for_log visible even if empty
+    # ==== 売却ログ強化：sold_lines が空でもスキップ理由を表示する ====
     if not sold_lines and sells_for_log:
         sold_lines = [f"（売却処理は実行されたが全てスキップ: {', '.join(sells_for_log)}）"]
     elif not sold_lines:
@@ -419,13 +433,13 @@ def simulate_continuous(all_df):
 
     sold_str = "\n".join(sold_lines)
     sells_for_log_summary = ";".join(sells_for_log) if sells_for_log else ""
-    buy_str = "\n".join([f"{p['ticker']} ({p['hold_days']}d) @ {p['buy_price']:.2f}" for p in new_positions]) if new_positions else "（新規購入なし）"
+    buy_str = "\n".join([f"{p['ticker']} ({p['hold_days']}日保有) @ {p['buy_price']:.2f}" for p in new_positions]) if new_positions else "（新規購入なし）"
 
-    run_date_jst = datetime.datetime.now(TZ).date()
+    run_date_jst = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9))).date()
     msg = (
         f"📅 **{run_date_jst} トレード結果**\n"
         f"**市場データ日:** {market_date.date()}\n"
-        f"**約定想定日:** {next_date.date() if next_date is not None else 'N/A'}\n"
+        f"**約定想定日（next trading date）:** {next_date.date() if next_date is not None else 'N/A'}\n"
         f"**売却:**\n{sold_str}\n"
         f"**売却(ログ簡易):** {sells_for_log_summary}\n"
         f"**新規購入:**\n{buy_str}\n"
@@ -438,89 +452,36 @@ def simulate_continuous(all_df):
     print(msg)
     notify_discord(msg)
 
-    # CSV row
-    prev_equity = None
-    try:
-        prev_df = pd.read_csv(LOG_FILE)
-        if len(prev_df)>0:
-            prev_equity = float(prev_df.iloc[-1]["equity"])
-    except Exception:
-        prev_equity = None
-    daily_ret = 0.0
-    if prev_equity is not None and prev_equity != 0:
-        daily_ret = (current_equity / prev_equity - 1.0) * 100.0
+    # CSV ログ書き込み
+    append_daily_log(run_date_jst=run_date_jst,
+                     market_date=market_date,
+                     realized=realized_pnl,
+                     unrealized=unrealized,
+                     equity=current_equity,
+                     capital=capital,
+                     positions=all_positions,
+                     buys=buys_for_log,
+                     sells=[sells_for_log_summary] if sells_for_log_summary else [])
 
-    row = {
-        "run_date_jst": run_date_jst.isoformat(),
-        "market_date": pd.to_datetime(market_date).date().isoformat(),
-        "status": "ok",
-        "realized_pnl": float(realized_pnl),
-        "unrealized_pnl": float(unrealized),
-        "equity": float(current_equity),
-        "capital": float(capital),
-        "num_positions": len(all_positions),
-        "positions": ";".join([f"{p['ticker']}:{p['hold_days']}/{p.get('held_days',0)}:{int(p['amount'])}" for p in all_positions]),
-        "buys": ";".join(buys_for_log) if buys_for_log else "",
-        "sells": sells_for_log_summary,
-        "daily_return_pct": float(daily_ret),
-        "error": ""
-    }
-    append_daily_log(row)
-
-# -------------------
-# Main wrapper with robust error logging
-# -------------------
+# =========================
+# メイン（JSTの土日スキップ）
+# =========================
 def main():
-    ensure_files_exist()
-    # skip weekend but still log skip row
-    today = datetime.datetime.now(TZ).date()
-    weekday = today.weekday()
+    weekday = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9))).weekday()
     if weekday >= 5:
-        row = {
-            "run_date_jst": today.isoformat(),
-            "market_date": "",
-            "status": "weekend_skip",
-            "realized_pnl": 0.0,
-            "unrealized_pnl": 0.0,
-            "equity": float(load_state().get("capital", INIT_CAPITAL)),
-            "capital": float(load_state().get("capital", INIT_CAPITAL)),
-            "num_positions": len(load_state().get("positions", [])),
-            "positions": "",
-            "buys": "",
-            "sells": "",
-            "daily_return_pct": 0.0,
-            "error": ""
-        }
-        append_daily_log(row)
-        print("[INFO] weekend - logged skip")
+        msg = f"🛌 {datetime.date.today()} は休場日のためスキップ"
+        print(msg)
+        notify_discord(msg)
         return
 
     try:
         all_df = load_all_data_fast(ALL_TICKERS)
-        simulate_continuous(all_df)
     except Exception as e:
-        tb = traceback.format_exc()
-        err_msg = str(e)[:2000]
-        print("[ERROR] exception during run:", err_msg)
-        # ensure we append an error row so files always show activity
-        run_date = datetime.datetime.now(TZ).date()
-        row = {
-            "run_date_jst": run_date.isoformat(),
-            "market_date": "",
-            "status": "error",
-            "realized_pnl": 0.0,
-            "unrealized_pnl": 0.0,
-            "equity": float(load_state().get("capital", INIT_CAPITAL)),
-            "capital": float(load_state().get("capital", INIT_CAPITAL)),
-            "num_positions": len(load_state().get("positions", [])),
-            "positions": "",
-            "buys": "",
-            "sells": "",
-            "daily_return_pct": 0.0,
-            "error": err_msg + "\n" + tb[:4000]
-        }
-        append_daily_log(row)
-        notify_discord(f"[ERROR] run failed: {err_msg}")
+        print(f"[ERROR] data load failed: {e}")
+        notify_discord(f"[ERROR] data load failed: {e}")
+        return
+
+    simulate_continuous(all_df)
 
 if __name__ == "__main__":
     main()
