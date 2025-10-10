@@ -1,14 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-AI株式シミュレーター 決定版（実運用リアルタイム）
-------------------------------------------------------------
-・6ヶ月学習 → 当日予測（p×μ法＋確率校正）
-・1日/3日/5日保有を再現（複数日ポジション継続）
-・残高・ポジションを equity_state.json に保存
-・Discordに日次損益と残高を通知
-・土日は自動スキップ
+AI株式シミュレーター（翌寄付き約定版・日次CSVログ付き・売却フォールバック）
+- 新規買い / 売却 は原則「翌取引日の始値（open）」で約定
+- SLIPPAGE を導入（買いは 1+SLIPPAGE、売りは 1-SLIPPAGE）
+- 売却時に当日/過去の価格が無ければフォールバックで利用
+- equity_state.json / equity_log.csv を更新
 """
-
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -37,11 +34,19 @@ FIXED_SCORE_QUANTILE = 0.50
 SOFTMAX_TEMP = 0.15
 RET_CLIP_LOW, RET_CLIP_HIGH = -0.08, 0.30
 
+# SLIPPAGE: 約定での価格悪化（例 0.0002 = 0.02%）
+SLIPPAGE = 0.0002
+
+# CSV ログ設定
+ENABLE_CSV_LOG = True
+LOG_FILE = Path("equity_log.csv")
+
+# Discord
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 STATE_FILE = Path("equity_state.json")
 
 ALL_TICKERS = [
-    "AAPL","MSFT","GOOGL","AMZN","META","NVDA","TSLA","AMD","NFLX","ADBE",
+    "AAPL","MSFT","GOOGL","AMZN","META","NVDA","TSLA","AMD","NFLFX","ADBE",
     "CRM","INTC","IBM","ORCL","QCOM","AVGO","CSCO","TXN","MU","SHOP",
     "SNOW","PANW","TEAM","DDOG","PLTR","UBER","ABNB","PYPL","NOW",
     "ZM","CRWD","MDB","RBLX","NET","ZS","COST","WMT","HD","LOW",
@@ -54,7 +59,7 @@ ALL_TICKERS = [
 ]
 
 # =========================
-# ユーティリティ関数
+# ユーティリティ関数（特徴量等）
 # =========================
 def rsi(series, n=14):
     diff = series.diff()
@@ -86,12 +91,25 @@ def load_all_data_fast(tickers):
     out = []
     for t in tickers:
         try:
-            df = data[t].copy().reset_index()
+            if isinstance(data.columns, pd.MultiIndex):
+                if t not in data.columns.levels[0]:
+                    print(f"⚠ データ無し: {t}")
+                    continue
+                df = data[t].copy().reset_index()
+            else:
+                df = data.copy().reset_index()
             df.columns = [c.lower() for c in df.columns]
+            need = {"date","open","high","low","close","volume"}
+            if not need.issubset(set(df.columns)):
+                print(f"⚠ 欠損列: {t}")
+                continue
             feat = make_features(df, t)
             out.append(feat)
-        except Exception:
+        except Exception as e:
+            print(f"⚠ {t}: {e}")
             continue
+    if not out:
+        raise RuntimeError("No data fetched.")
     all_df = pd.concat(out, ignore_index=True).sort_values(["date","ticker"]).reset_index(drop=True)
     print(f"全データ件数: {len(all_df)}; 期間: {all_df['date'].min().date()} ～ {all_df['date'].max().date()}")
     return all_df
@@ -109,20 +127,41 @@ def train_models(df):
     }
     models = {}
     for k in ["1","3","5"]:
-        X, y = df[FEATS], df[f"label{k}"]
+        d = df.dropna(subset=[f"label{k}"])
+        if d.empty:
+            models[k] = None
+            continue
+        X, y = d[FEATS], d[f"label{k}"]
         models[k] = lgb.train(params, lgb.Dataset(X, label=y))
     return models
 
 def predict_models(models, df):
     X = df[FEATS]
-    return {f"p{k}": models[k].predict(X) for k in ["1","3","5"]}
+    out = {}
+    for k in ["1","3","5"]:
+        if models.get(k) is None:
+            out[f"p{k}"] = np.zeros(len(df))
+        else:
+            out[f"p{k}"] = models[k].predict(X)
+    return out
 
 def estimate_mu(df):
     mu = {}
     for k in ["1","3","5"]:
         pos = df[f"ret_next{k}"].loc[df[f"label{k}"]==1]
-        mu[k] = pos.mean() if len(pos)>0 else 0
+        mu[k] = pos.mean() if len(pos)>0 else 0.0
     return mu
+
+# =========================
+# 状態管理 / Discord / CSV logging
+# =========================
+def load_state():
+    if not STATE_FILE.exists():
+        return {"capital": INIT_CAPITAL, "positions": []}
+    return json.load(open(STATE_FILE, "r", encoding="utf-8"))
+
+def save_state(state):
+    json.dump(state, open(STATE_FILE, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
 
 def notify_discord(msg):
     if not DISCORD_WEBHOOK_URL:
@@ -132,101 +171,243 @@ def notify_discord(msg):
     except Exception as e:
         print(f"Discord通知失敗: {e}")
 
-def load_state():
-    if not STATE_FILE.exists():
-        return {"capital": INIT_CAPITAL, "positions": []}
-    return json.load(open(STATE_FILE, "r", encoding="utf-8"))
+def append_daily_log(run_date_jst, market_date, realized, unrealized, equity, capital, positions, buys, sells):
+    if not ENABLE_CSV_LOG:
+        return
+    pos_summary = []
+    for p in positions:
+        pos_summary.append(f"{p['ticker']}:{p['hold_days']}/{p.get('held_days',0)}:{int(p['amount'])}")
+    pos_summary_str = ";".join(pos_summary)
+    buys_str = ";".join(buys) if buys else ""
+    sells_str = ";".join(sells) if sells else ""
 
-def save_state(state):
-    json.dump(state, open(STATE_FILE, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
+    prev_equity = None
+    if LOG_FILE.exists():
+        try:
+            prev = pd.read_csv(LOG_FILE)
+            if len(prev)>0:
+                prev_equity = float(prev.iloc[-1]["equity"])
+        except Exception:
+            prev_equity = None
+
+    if prev_equity is None or prev_equity == 0:
+        daily_ret = 0.0
+    else:
+        daily_ret = (equity / prev_equity - 1.0) * 100.0
+
+    row = {
+        "run_date_jst": run_date_jst.isoformat(),
+        "market_date": pd.to_datetime(market_date).date().isoformat(),
+        "realized_pnl": float(realized),
+        "unrealized_pnl": float(unrealized),
+        "equity": float(equity),
+        "capital": float(capital),
+        "num_positions": len(positions),
+        "positions": pos_summary_str,
+        "buys": buys_str,
+        "sells": sells_str,
+        "daily_return_pct": float(daily_ret)
+    }
+
+    dfrow = pd.DataFrame([row])
+    header = not LOG_FILE.exists()
+    dfrow.to_csv(LOG_FILE, mode="a", index=False, header=header)
 
 # =========================
-# 実運用：複数日保有＋継続運用
+# 売却フォールバック用ヘルパー
+# =========================
+def get_last_available_price(all_df_local, ticker, date):
+    sub = all_df_local[(all_df_local["ticker"]==ticker) & (all_df_local["date"]<=date)].sort_values("date", ascending=False)
+    if not sub.empty:
+        return float(sub.iloc[0]["close"])
+    return None
+
+# =========================
+# シミュレーション（翌寄付き約定ロジック）
 # =========================
 def simulate_continuous(all_df):
     df = all_df.copy()
     df["date"] = pd.to_datetime(df["date"])
-    today = df["date"].max()
-    tr = df[df["date"] >= today - pd.DateOffset(months=6)]
-    te = df[df["date"] == today]
+    unique_dates = sorted(df["date"].unique())
+    market_date = df["date"].max()           # シグナル算出に使う最新市場データ日
+    # next trading date (for next-open execution), if exists
+    try:
+        idx_today = unique_dates.index(pd.Timestamp(market_date))
+        next_date = unique_dates[idx_today + 1] if idx_today + 1 < len(unique_dates) else None
+    except ValueError:
+        next_date = None
+
+    tr = df[df["date"] >= market_date - pd.DateOffset(months=6)]
+    te = df[df["date"] == market_date]
+    df_next = df[df["date"] == next_date] if next_date is not None else pd.DataFrame(columns=df.columns)
+
     if tr.empty or te.empty:
         print("⚠ データ不足")
         return
 
+    # マップ化（高速アクセス用）
+    te_close_map = {r.ticker: float(r.close) for r in te.itertuples()}
+    te_open_map = {r.ticker: float(r.open) for r in te.itertuples()}
+    next_open_map = {r.ticker: float(r.open) for r in df_next.itertuples()} if not df_next.empty else {}
+    next_close_map = {r.ticker: float(r.close) for r in df_next.itertuples()} if not df_next.empty else {}
+
     state = load_state()
-    capital = state["capital"]
-    old_positions = state["positions"]
-    day_profit = 0
+    capital = state.get("capital", INIT_CAPITAL)
+    old_positions = state.get("positions", [])
+    realized_pnl = 0.0
     sold_lines = []
+    sells_for_log = []
+    sells_skipped_for_log = []
     remaining = []
 
-    # === 売却処理 ===
+    # ---------- 売却処理（保有満了→原則 next_open で約定、なければフォールバック） ----------
     for pos in old_positions:
-        pos["held_days"] += 1
+        pos["held_days"] = pos.get("held_days", 0) + 1
         if pos["held_days"] >= pos["hold_days"]:
-            row = te[te["ticker"]==pos["ticker"]]
-            if not row.empty:
-                sell_price = row["close"].iloc[0]
-                profit = (sell_price/pos["buy_price"]-1)*pos["amount"]
-                day_profit += profit
-                sold_lines.append(f"{pos['ticker']} +{profit:,.0f}円")
+            sell_price = None
+            sell_source = None
+            # 優先：翌営業日の始値（next_open）
+            if next_date is not None and pos["ticker"] in next_open_map:
+                sell_price = next_open_map[pos["ticker"]] * (1.0 - SLIPPAGE)
+                sell_source = f"next_open({next_date.date()})"
+            # 次の優先：当日の終値（te_close）
+            elif pos["ticker"] in te_close_map:
+                sell_price = te_close_map[pos["ticker"]] * (1.0 - SLIPPAGE)
+                sell_source = f"te_close({market_date.date()})"
+            else:
+                # フォールバック：全データから直近利用可能な close を使う
+                last_price = get_last_available_price(df, pos["ticker"], market_date)
+                if last_price is not None:
+                    sell_price = last_price * (1.0 - SLIPPAGE)
+                    sell_source = "last_available_before_or_on_market_date"
+                else:
+                    sell_price = None
+                    sell_source = "no_price_found"
+
+            if sell_price is None:
+                # 価格が無くて売却できない → 保有継続
+                remaining.append(pos)
+                sells_skipped_for_log.append(f"{pos['ticker']}:skip_no_price")
+                continue
+
+            # 利益計算（手数料を考慮）
+            shares = pos["amount"] / pos["buy_price"]
+            proceeds = shares * sell_price
+            buy_comm = COMMISSION * pos["amount"]
+            sell_comm = COMMISSION * proceeds
+            profit = proceeds - pos["amount"] - buy_comm - sell_comm
+
+            realized_pnl += profit
+            sold_lines.append(f"{pos['ticker']} ({pos['hold_days']}日): {((sell_price/pos['buy_price']-1)*100):+.2f}% ({profit:+,.0f}円) [{sell_source}]")
+            sells_for_log.append(f"{pos['ticker']}:profit={profit:+.0f}:src={sell_source}")
         else:
             remaining.append(pos)
-    capital += day_profit
 
-    # === 新規購入 ===
+    # スキップログを統合
+    if sells_skipped_for_log:
+        sells_for_log.extend(sells_skipped_for_log)
+
+    capital += realized_pnl
+
+    # ---------- 新規購入（シグナルに対し next_open を優先して約定価格を設定） ----------
     add_future_labels_inplace(tr)
     add_future_labels_inplace(te)
     models = train_models(tr)
     mu = estimate_mu(tr)
     preds = predict_models(models, te)
+
     scores = np.vstack([preds["p1"]*mu["1"], preds["p3"]*mu["3"], preds["p5"]*mu["5"]]).T
-    best_idx = np.argmax(scores, axis=1)
     best_score = scores.max(axis=1)
     te["score"] = best_score
     thr = np.quantile(best_score, FIXED_SCORE_QUANTILE)
-    buys = te[te["score"]>=thr].sort_values("score", ascending=False).head(TOP_K)
-    if buys.empty:
-        save_state({"capital": capital, "positions": remaining})
-        notify_discord(f"📅 {today.date()} 取引なし\n損益: {day_profit:+,.0f}円\n残高: {capital:,.0f}円")
-        return
+    buys_df = te[te["score"] >= thr].sort_values("score", ascending=False).head(TOP_K)
 
-    per_trade = capital * PER_POS_FRAC / len(buys)
     new_positions = []
-    for i, row in enumerate(buys.itertuples()):
-        p1, p3, p5 = preds["p1"][i], preds["p3"][i], preds["p5"][i]
-        idx = np.argmax([p1*mu["1"], p3*mu["3"], p5*mu["5"]])
-        hold_days = [1,3,5][idx]
-        new_positions.append({
-            "ticker": row.ticker,
-            "buy_price": row.close,
-            "amount": per_trade,
-            "hold_days": hold_days,
-            "held_days": 0
-        })
+    buys_for_log = []
+    if not buys_df.empty:
+        per_trade = capital * PER_POS_FRAC / len(buys_df)
+        for i, row in enumerate(buys_df.itertuples()):
+            p1, p3, p5 = preds["p1"][i], preds["p3"][i], preds["p5"][i]
+            idx = np.argmax([p1*mu["1"], p3*mu["3"], p5*mu["5"]])
+            hold_days = [1,3,5][idx]
+
+            # 約定価格の決定（優先: next_open -> 当日終値 -> 直近 available）
+            buy_price = None
+            buy_source = None
+            if next_date is not None and row.ticker in next_open_map:
+                buy_price = next_open_map[row.ticker] * (1.0 + SLIPPAGE)
+                buy_source = f"next_open({next_date.date()})"
+            elif row.ticker in te_close_map:
+                buy_price = te_close_map[row.ticker] * (1.0 + SLIPPAGE)
+                buy_source = f"te_close({market_date.date()})"
+            else:
+                last_price = get_last_available_price(df, row.ticker, market_date)
+                if last_price is not None:
+                    buy_price = last_price * (1.0 + SLIPPAGE)
+                    buy_source = "last_available_before_or_on_market_date"
+                else:
+                    # 価格が取得できない銘柄はスキップ（安全）
+                    continue
+
+            new_positions.append({
+                "ticker": row.ticker,
+                "buy_price": float(buy_price),
+                "amount": float(per_trade),
+                "hold_days": int(hold_days),
+                "held_days": 0
+            })
+            buys_for_log.append(f"{row.ticker}:hold={hold_days}:price={buy_price:.2f}:src={buy_source}")
 
     all_positions = remaining + new_positions
+
+    # 含み評価（評価には market_date の終値を用いる。必要なら next_close_map に変更可能）
+    unrealized = 0.0
+    for pos in all_positions:
+        cur_price = te_close_map.get(pos["ticker"], pos["buy_price"])
+        unrealized += (cur_price / pos["buy_price"] - 1.0) * pos["amount"]
+
+    current_equity = capital + unrealized
+
+    # 状態保存（capital は確定残高）
     state = {"capital": capital, "positions": all_positions}
     save_state(state)
 
+    # 通知作成（JSTベースの実行日）
+    run_date_jst = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9))).date()
     sold_str = "\n".join(sold_lines) if sold_lines else "（売却なし）"
-    buy_str = "\n".join([f"{p['ticker']} ({p['hold_days']}日保有)" for p in new_positions])
+    buy_str = "\n".join([f"{p['ticker']} ({p['hold_days']}日保有) @ {p['buy_price']:.2f}" for p in new_positions]) if new_positions else "（新規購入なし）"
+
     msg = (
-        f"📅 **{today.date()} トレード結果**\n"
+        f"📅 **{run_date_jst} トレード結果**\n"
+        f"**市場データ日:** {market_date.date()}\n"
+        f"**約定想定日（next trading date）:** {next_date.date() if next_date is not None else 'N/A'}\n"
         f"**売却:**\n{sold_str}\n"
         f"**新規購入:**\n{buy_str}\n"
-        f"**損益:** {day_profit:+,.0f}円\n"
-        f"**残高:** {capital:,.0f}円"
+        f"**実現損益:** {realized_pnl:+,.0f}円\n"
+        f"**含み損益:** {unrealized:+,.0f}円\n"
+        f"**評価残高（含み込み）:** {current_equity:,.0f}円\n"
+        f"**確定残高（現金）:** {capital:,.0f}円"
     )
     print(msg)
     notify_discord(msg)
 
+    # CSV ログ書き込み
+    append_daily_log(run_date_jst=run_date_jst,
+                     market_date=market_date,
+                     realized=realized_pnl,
+                     unrealized=unrealized,
+                     equity=current_equity,
+                     capital=capital,
+                     positions=all_positions,
+                     buys=buys_for_log,
+                     sells=sells_for_log)
+
 # =========================
-# メイン実行
+# メイン実行（土日スキップ）
 # =========================
 def main():
-    # === 土日スキップ ===
-    weekday = datetime.datetime.now().weekday()  # 月=0, 日=6
+    # 土日スキップ（JSTベース）
+    weekday = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9))).weekday()  # 月=0, 日=6
     if weekday >= 5:
         msg = f"🛌 {datetime.date.today()} は休場日のためスキップ"
         print(msg)
@@ -238,6 +419,8 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
 
 
 
