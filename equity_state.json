@@ -1,4 +1,82 @@
 {
-  "capital": 1000000,
-  "positions": []
+  "capital": 327843.05852285476,
+  "positions": [
+    {
+      "ticker": "PSX",
+      "buy_price": 132.89281531546337,
+      "amount": 120000.00000000001,
+      "hold_days": 5,
+      "held_days": 3
+    },
+    {
+      "ticker": "META",
+      "buy_price": 717.8635146972656,
+      "amount": 53333.33333333334,
+      "hold_days": 5,
+      "held_days": 3
+    },
+    {
+      "ticker": "TSLA",
+      "buy_price": 447.9095713256836,
+      "amount": 53333.33333333334,
+      "hold_days": 5,
+      "held_days": 3
+    },
+    {
+      "ticker": "CRWD",
+      "buy_price": 491.8683430114746,
+      "amount": 42666.666666666664,
+      "hold_days": 5,
+      "held_days": 2
+    },
+    {
+      "ticker": "ADBE",
+      "buy_price": 350.07,
+      "amount": 42666.666666666664,
+      "hold_days": 5,
+      "held_days": 2
+    },
+    {
+      "ticker": "OXY",
+      "buy_price": 45.37907293167114,
+      "amount": 42666.666666666664,
+      "hold_days": 5,
+      "held_days": 2
+    },
+    {
+      "ticker": "F",
+      "buy_price": 11.662594668753497,
+      "amount": 61470.573473035285,
+      "hold_days": 5,
+      "held_days": 0
+    },
+    {
+      "ticker": "PLTR",
+      "buy_price": 183.61671783142089,
+      "amount": 34150.31859613071,
+      "hold_days": 5,
+      "held_days": 1
+    },
+    {
+      "ticker": "DHR",
+      "buy_price": 204.85095955810547,
+      "amount": 34150.31859613071,
+      "hold_days": 5,
+      "held_days": 1
+    },
+    {
+      "ticker": "BLK",
+      "buy_price": 1172.7345,
+      "amount": 27320.25487690457,
+      "hold_days": 5,
+      "held_days": 0
+    },
+    {
+      "ticker": "LMT",
+      "buy_price": 508.93175256958006,
+      "amount": 27320.25487690457,
+      "hold_days": 5,
+      "held_days": 0
+    }
+  ]
 }
