@@ -38,7 +38,7 @@ STATE_FILE = Path("equity_state.json")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
 # Behavior
-DEBUG = False
+DEBUG = True
 
 # Universe (adjust as needed)
 ALL_TICKERS = [
@@ -524,6 +524,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
