@@ -1,1 +1,8 @@
+date,action,ticker,price,amount,pnl,hold_days,held_days,src
+2025-10-14,BUY,NVDA,188.36,66667,,5,0,te_close(2025-10-13)
+2025-10-14,BUY,PYPL,68.87,66667,,5,0,te_close(2025-10-13)
+2025-10-14,BUY,NKE,67.39,66667,,5,0,te_close(2025-10-13)
+2025-10-15,BUY,QCOM,161.77,66667,,5,0,te_close(2025-10-14)
+2025-10-15,BUY,BA,214.34,66667,,5,0,te_close(2025-10-14)
+2025-10-15,BUY,FDX,234.72,66667,,5,0,te_close(2025-10-14)
 
