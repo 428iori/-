@@ -2,25 +2,46 @@
   "capital": 799900.0,
   "positions": [
     {
+      "ticker": "NVDA",
+      "buy_price": 188.36,
+      "amount": 66667,
+      "hold_days": 5,
+      "held_days": 2
+    },
+    {
+      "ticker": "PYPL",
+      "buy_price": 68.87,
+      "amount": 66667,
+      "hold_days": 5,
+      "held_days": 2
+    },
+    {
+      "ticker": "NKE",
+      "buy_price": 67.39,
+      "amount": 66667,
+      "hold_days": 5,
+      "held_days": 2
+    },
+    {
       "ticker": "QCOM",
       "buy_price": 161.77,
       "amount": 66667,
       "hold_days": 5,
-      "held_days": 0
+      "held_days": 1
     },
     {
       "ticker": "BA",
       "buy_price": 214.34,
       "amount": 66667,
       "hold_days": 5,
-      "held_days": 0
+      "held_days": 1
     },
     {
       "ticker": "FDX",
       "buy_price": 234.72,
       "amount": 66667,
       "hold_days": 5,
-      "held_days": 0
+      "held_days": 1
     }
   ]
 }
