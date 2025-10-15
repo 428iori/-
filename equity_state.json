@@ -1,0 +1,26 @@
+{
+  "capital": 799900.0,
+  "positions": [
+    {
+      "ticker": "QCOM",
+      "buy_price": 161.77,
+      "amount": 66667,
+      "hold_days": 5,
+      "held_days": 0
+    },
+    {
+      "ticker": "BA",
+      "buy_price": 214.34,
+      "amount": 66667,
+      "hold_days": 5,
+      "held_days": 0
+    },
+    {
+      "ticker": "FDX",
+      "buy_price": 234.72,
+      "amount": 66667,
+      "hold_days": 5,
+      "held_days": 0
+    }
+  ]
+}
