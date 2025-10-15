@@ -73,11 +73,15 @@ X, y = df[FEATS], df["label1"]
 # ============================================================
 # 学習（時系列分割で安定化）
 # ============================================================
+# ============================================================
+# 学習（時系列分割で安定化）
+# ============================================================
 print("[train] training model ...")
 tscv = TimeSeriesSplit(n_splits=5)
 models, aucs = [], []
-for i, (tr, te) in enumerate(tscv.split(X)):
-    Xtr, Xte, ytr, yte = X.iloc[tr], X.iloc[te], y.iloc[te]
+for i, (train_idx, test_idx) in enumerate(tscv.split(X)):
+    Xtr, Xte = X.iloc[train_idx], X.iloc[test_idx]
+    ytr, yte = y.iloc[train_idx], y.iloc[test_idx]
     model = lgb.train(BEST_PARAMS, lgb.Dataset(Xtr, label=ytr))
     pred = model.predict(Xte)
     auc = roc_auc_score(yte, pred)
