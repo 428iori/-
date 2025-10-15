@@ -92,10 +92,16 @@ def walk_forward_eval(df, params, n_splits=5):
     for i, (tr, te) in enumerate(tscv.split(X)):
         dtrain = lgb.Dataset(X.iloc[tr], label=y.iloc[tr])
         dtest = lgb.Dataset(X.iloc[te], label=y.iloc[te])
-        model = lgb.train(params, dtrain, valid_sets=[dtest], verbose_eval=False)
+        model = lgb.train(
+            params,
+            dtrain,
+            valid_sets=[dtest],
+            callbacks=[lgb.log_evaluation(period=0)]  # 👈 verbose_eval=False の代わり
+        )
         preds = model.predict(X.iloc[te])
         aucs.append(roc_auc_score(y.iloc[te], preds))
     return np.mean(aucs)
+
 
 # ============ Optuna探索 ============
 def run_optuna_search(tickers, start, end, n_trials_local, seed=42):
