@@ -1,0 +1,3 @@
+run_date_jst,market_date,status,realized_pnl,unrealized_pnl,equity,capital,num_positions,positions,buys,sells,daily_return_pct,error
+2025-10-14,2025-10-13,ok,0.0,-40.0,799860.0,799900.0,3,"NVDA:5/0:66667;PYPL:5/0:66667;NKE:5/0:66667","NVDA buy 66667 @188.36;PYPL buy 66667 @68.87;NKE buy 66667 @67.39","",0.0,
+2025-10-15,2025-10-14,ok,0.0,-40.0,799860.0,799900.0,3,"QCOM:5/0:66667;BA:5/0:66667;FDX:5/0:66667","QCOM buy 66667 @161.77;BA buy 66667 @214.34;FDX buy 66667 @234.72","",0.0,
